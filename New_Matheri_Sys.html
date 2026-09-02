@@ -117,7 +117,187 @@ nid:{m:7,p:8,c:3,cp:5,d:3,e:4,s:2,sms:1,min:1,bd:1,dep:1,ast:1,ai:1,u:3}
 }}
 
 function loadDB(){try{var r=localStorage.getItem(V);return r?JSON.parse(r):null}catch(e){return null}}
-function save(){localStorage.setItem(V,JSON.stringify(DB))}
+
+// ─── CLOUD SYNC (Supabase) ───
+var SUPABASE_URL='https://bprqamzunmzzsjfrzwve.supabase.co';
+var SUPABASE_KEY='sb_publishable_3QqGnus_hIebXvjwRSrZGQ_0h22h8E-';
+var CLOUD_ROW_ID=1;
+var cloudSyncTimer=null;
+var lastCloudUpdatedAt=null;
+function cloudHeaders(extra){
+  var h={'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Content-Type':'application/json'};
+  if(extra)for(var k in extra)h[k]=extra[k];
+  return h;
+}
+var pendingSync=false;
+function sanitizeForCloud(db){
+  var clone=JSON.parse(JSON.stringify(db));
+  (clone.users||[]).forEach(function(u){u.password=''});
+  (clone.members||[]).forEach(function(m){m.customPassword=''});
+  return clone;
+}
+function mergeLocalSecrets(oldDB,newDB){
+  if(!oldDB)return newDB;
+  var oldUsersById={};(oldDB.users||[]).forEach(function(u){oldUsersById[u.id]=u});
+  (newDB.users||[]).forEach(function(u){
+    var old=oldUsersById[u.id];
+    if(old&&old.password&&!u.password)u.password=old.password;
+  });
+  var oldMembersById={};(oldDB.members||[]).forEach(function(m){oldMembersById[m.id]=m});
+  (newDB.members||[]).forEach(function(m){
+    var old=oldMembersById[m.id];
+    if(old&&old.customPassword&&!m.customPassword)m.customPassword=old.customPassword;
+  });
+  return newDB;
+}
+function pushToCloud(){
+  if(cloudSyncTimer)clearTimeout(cloudSyncTimer);
+  cloudSyncTimer=setTimeout(function(){
+    var now=new Date().toISOString();
+    if(navigator.onLine===false){
+      pendingSync=true;
+      if(typeof syncState!=='undefined'){syncState='offline';refreshSyncBtn()}
+      return;
+    }
+    if(typeof syncState!=='undefined'){syncState='syncing';refreshSyncBtn()}
+    fetch(SUPABASE_URL+'/rest/v1/group_data?on_conflict=id',{
+      method:'POST',
+      headers:cloudHeaders({'Prefer':'resolution=merge-duplicates'}),
+      body:JSON.stringify({id:CLOUD_ROW_ID,data:sanitizeForCloud(DB),updated_at:now})
+    }).then(function(){
+      lastCloudUpdatedAt=now;pendingSync=false;
+      if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
+    }).catch(function(e){
+      console.warn('Cloud sync failed, will retry when back online:',e);
+      pendingSync=true;
+      if(typeof syncState!=='undefined'){syncState=(navigator.onLine===false?'offline':'error');refreshSyncBtn()}
+    });
+  },1200);
+}
+window.addEventListener('online',function(){if(pendingSync)pushToCloud()});
+
+// ─── SEPARATE LOCKED-DOWN LOGIN SYSTEM (app_logins table) ───
+function cloudUpsertLogin(loginKey,password,role,roleLabel,memberId,house,position,displayName){
+  if(!loginKey||!password)return;
+  fetch(SUPABASE_URL+'/rest/v1/rpc/upsert_login',{
+    method:'POST',headers:cloudHeaders(),
+    body:JSON.stringify({p_login_key:loginKey,p_password:password,p_role:role,p_role_label:roleLabel||role,p_member_id:memberId||null,p_house:house||null,p_position:position||null,p_display_name:displayName||''})
+  }).catch(function(e){console.warn('Login sync failed (local login still works):',e)});
+}
+function cloudDisableLogin(loginKey){
+  if(!loginKey)return;
+  fetch(SUPABASE_URL+'/rest/v1/rpc/disable_login',{
+    method:'POST',headers:cloudHeaders(),
+    body:JSON.stringify({p_login_key:loginKey})
+  }).catch(function(e){console.warn('Login disable sync failed:',e)});
+}
+function syncMemberLoginToCloud(member){
+  if(!member||!member.idNo)return;
+  var posRole=getPositionRole(member.position);
+  var roleLabel=posRole==='Member'?'Member':member.position;
+  var pwd=(member.customPassword?member.customPassword:member.no).toUpperCase();
+  cloudUpsertLogin(member.idNo,pwd,posRole,roleLabel,member.id,null,member.position,member.name);
+  // If this member is currently a house rep anywhere, keep that login in sync too
+  Object.keys(DB.settings.houseReps||{}).forEach(function(h){
+    if(DB.settings.houseReps[h]===member.id)syncHouseRepLoginToCloud(h);
+  });
+}
+function syncHouseRepLoginToCloud(house){
+  var repId=DB.settings.houseReps[house];
+  var repMember=repId?DB.members.find(function(m){return m.id===repId&&m.house===house}):null;
+  if(!repMember){cloudDisableLogin(house);return}
+  var pwd=(repMember.customPassword?repMember.customPassword:repMember.no).toUpperCase();
+  cloudUpsertLogin(house,pwd,'HouseRep','House Representative',repMember.id,house,null,repMember.name+' (House Rep: '+house+')');
+}
+function syncStaffLoginToCloud(acct){
+  if(!acct)return;
+  if(!acct.active){cloudDisableLogin(acct.username);return}
+  cloudUpsertLogin(acct.username,acct.password,tierForRoleLabel(acct.role),acct.role,null,acct.house||null,null,acct.name);
+}
+function migrateAllLoginsToCloud(skipConfirm){
+  if(!skipConfirm&&!confirm('Push all current staff accounts, members, and house reps up as logins in the cloud table? This can be run any time and is safe to repeat.'))return;
+  DB.users.forEach(syncStaffLoginToCloud);
+  DB.members.forEach(syncMemberLoginToCloud);
+  Object.keys(DB.settings.houseReps||{}).forEach(syncHouseRepLoginToCloud);
+  toast('Migrating '+DB.users.length+' staff accounts and '+DB.members.length+' member logins — this runs in the background over the next few seconds');
+}
+function pullFromCloud(cb){
+  fetch(SUPABASE_URL+'/rest/v1/group_data?id=eq.'+CLOUD_ROW_ID+'&select=data,updated_at',{headers:cloudHeaders()})
+    .then(function(r){return r.json()})
+    .then(function(rows){
+      if(rows&&rows.length&&rows[0]&&rows[0].data){
+        if(rows[0].updated_at!==lastCloudUpdatedAt){
+          lastCloudUpdatedAt=rows[0].updated_at;
+          DB=mergeLocalSecrets(DB,rows[0].data);
+          localStorage.setItem(V,JSON.stringify(DB));
+          if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
+          if(cb)cb(true);
+        } else {
+          if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
+          if(cb)cb(false);
+        }
+      } else {
+        pushToCloud(); // no cloud row yet — seed it with our current local data
+        if(cb)cb(false);
+      }
+    })
+    .catch(function(e){console.warn('Cloud pull failed:',e);if(typeof syncState!=='undefined'){syncState='error';refreshSyncBtn()}if(cb)cb(false)});
+}
+function save(){localStorage.setItem(V,JSON.stringify(DB));pushToCloud()}
+
+// ─── TAP-TO-SEND SMS (opens phone's Messages app, pre-filled) ───
+function normalizePhoneForSms(phone){
+  var clean=(phone||'').replace(/[\s\-()]/g,'');
+  if(!clean)return'';
+  if(clean.charAt(0)==='+')return clean;
+  if(clean.indexOf('254')===0)return'+'+clean;
+  if(clean.charAt(0)==='0')return'+254'+clean.slice(1);
+  return clean;
+}
+function openSmsCompose(phone,message){
+  var clean=normalizePhoneForSms(phone);
+  if(!clean){toast('No phone number on file for this member — SMS not sent');return}
+  window.location.href='sms:'+clean+'?body='+encodeURIComponent(message);
+}
+function paymentConfirmMessage(member,amount,month){
+  var bal=getMemberBalance(member.id);
+  return'Dear '+member.name+', we have received your KES '+amount+' contribution for '+(month||'')+'. Outstanding balance: KES '+bal+'. Thank you. — '+DB.settings.groupName;
+}
+function sendPaymentConfirmationSMS(member,amount,month){
+  if(!member||!member.phone)return;
+  openSmsCompose(member.phone,paymentConfirmMessage(member,amount,month));
+}
+var syncState='idle'; // idle | syncing | synced | error
+function syncStatusLabel(){
+  if(syncState==='syncing')return'⏳ Syncing…';
+  if(syncState==='offline')return'📴 Offline — saved locally, will sync';
+  if(syncState==='error')return'⚠ Sync failed — tap to retry';
+  if(pendingSync)return'⏳ Changes pending sync';
+  if(lastCloudUpdatedAt)return'☁ Synced — tap to refresh';
+  return'☁ Sync Now';
+}
+function refreshSyncBtn(){var b=document.getElementById('syncBtn');if(b)b.textContent=syncStatusLabel()}
+function manualSync(){
+  syncState='syncing';refreshSyncBtn();
+  fetch(SUPABASE_URL+'/rest/v1/group_data?id=eq.'+CLOUD_ROW_ID+'&select=data,updated_at',{headers:cloudHeaders()})
+    .then(function(r){return r.json()})
+    .then(function(rows){
+      if(rows&&rows.length&&rows[0]&&rows[0].data){
+        lastCloudUpdatedAt=rows[0].updated_at;
+        DB=mergeLocalSecrets(DB,rows[0].data);
+        localStorage.setItem(V,JSON.stringify(DB));
+        syncState='synced';
+        toast('Updated with latest shared data');
+        render();
+      } else {
+        pushToCloud();
+        syncState='synced';
+        toast('No shared data found yet — this device is now the starting copy');
+        refreshSyncBtn();
+      }
+    })
+    .catch(function(e){syncState='error';toast('Sync failed — check your connection');refreshSyncBtn();console.warn(e)});
+}
 var DB=loadDB()||defaultDB();
 // Migration: ensure users table exists for DBs saved before user management was added
 (function migrateUsers(){
@@ -165,6 +345,27 @@ document.documentElement.style.setProperty('--bg-image','url("'+IMG_BG+'")');
 function activeMems(){return sortByName(DB.members.filter(function(m){return m.status==='Active'}))}
 function inactiveMems(){return sortByName(DB.members.filter(function(m){return m.status==='Inactive'}))}
 
+function secondSundayOfMonth(year,monthIndex){
+  var d=new Date(year,monthIndex,1);
+  var firstSunday=1+((7-d.getDay())%7);
+  return new Date(year,monthIndex,firstSunday+7);
+}
+// The current calendar month only counts toward a member's balance/arrears
+// starting the day AFTER the second Sunday of that month (i.e. the Monday).
+// Before that date, the month is treated as "not yet due" and the cutoff
+// falls back to the previous month — giving members a grace window at the
+// start of each month that runs through the second Sunday.
+function getBalanceCutoff(){
+  var now=new Date();
+  var secondSun=secondSundayOfMonth(now.getFullYear(),now.getMonth());
+  var cutoffStart=new Date(secondSun.getFullYear(),secondSun.getMonth(),secondSun.getDate()+1);
+  if(now<cutoffStart){
+    var y=now.getFullYear(),m=now.getMonth()-1;
+    if(m<0){m=11;y--}
+    return{year:y,monthIndex:m};
+  }
+  return{year:now.getFullYear(),monthIndex:now.getMonth()};
+}
 function getMemberLedgerThrough(memberId,cutoffYear,cutoffMonthIndex){
   var monthly=DB.settings.monthlyAmount;
   var member=DB.members.find(function(x){return x.id===memberId});
@@ -190,17 +391,17 @@ function getMemberLedgerThrough(memberId,cutoffYear,cutoffMonthIndex){
   return{months:full,totalDue:full.length*monthly,totalPaidAllTime:totalPaidAllTime,advanceCredit:advanceCredit};
 }
 function getMemberAdvanceCredit(mid){
-  var now=new Date();
-  return getMemberLedgerThrough(mid,now.getFullYear(),now.getMonth()).advanceCredit;
+  var c=getBalanceCutoff();
+  return getMemberLedgerThrough(mid,c.year,c.monthIndex).advanceCredit;
 }
 function getMemberUnpaidMonths(mid){
-  var now=new Date();
-  var ledger=getMemberLedgerThrough(mid,now.getFullYear(),now.getMonth());
+  var c=getBalanceCutoff();
+  var ledger=getMemberLedgerThrough(mid,c.year,c.monthIndex);
   return ledger.months.filter(function(mm){return mm.status!=='Paid'}).map(function(mm){return mm.label});
 }
 function getMemberBalance(mid){
-  var now=new Date();
-  var ledger=getMemberLedgerThrough(mid,now.getFullYear(),now.getMonth());
+  var c=getBalanceCutoff();
+  var ledger=getMemberLedgerThrough(mid,c.year,c.monthIndex);
   return Math.max(0,ledger.totalDue-ledger.totalPaidAllTime);
 }
 function getMemberDeductionBal(mid){return DB.deductions.filter(function(d){return d.memberId===mid&&d.status==='Outstanding'}).reduce(function(s,d){return s+(d.amount-d.paid)},0)}
@@ -556,6 +757,38 @@ function getOfficerExpectedPassword(member){
 
 function doLogin(){
   var u=document.getElementById('lu').value.trim(),p=document.getElementById('lp').value.trim();
+  S.loginBusy=true;render();
+  fetch(SUPABASE_URL+'/rest/v1/rpc/login_check',{
+    method:'POST',headers:cloudHeaders(),
+    body:JSON.stringify({p_username:u,p_password:p})
+  }).then(function(r){return r.json()}).then(function(rows){
+    S.loginBusy=false;
+    if(rows&&rows.length){
+      applyLoginSession(rows[0]);
+    }else{
+      doLocalLoginFallback(u,p); // no cloud match — fall back to local check (covers pre-migration accounts)
+    }
+  }).catch(function(){
+    S.loginBusy=false;
+    doLocalLoginFallback(u,p); // offline — fall back to local check
+  });
+}
+function applyLoginSession(row){
+  if(row.role==='HouseRep'){
+    S.user={name:row.display_name,role:'HouseRep',roleLabel:'House Representative',house:row.house,memberId:row.member_id};
+    S.role='HouseRep';S.page='dashboard';S.err='';render();return;
+  }
+  if(row.member_id){
+    var posRole=row.role;
+    S.user={name:row.display_name,role:posRole,roleLabel:row.role_label,memberId:row.member_id,position:row.position||undefined};
+    S.role=posRole;S.page=(posRole==='Member')?'my-statement':'dashboard';S.err='';render();return;
+  }
+  // Staff account (Admin/Secretary/etc.)
+  var acct=DB.users.find(function(x){return x.username&&row.display_name&&x.name===row.display_name&&tierForRoleLabel(x.role)===row.role});
+  S.user={name:row.display_name,role:row.role,roleLabel:row.role_label,userId:acct?acct.id:null,house:row.house||null};
+  S.role=row.role;S.page='dashboard';S.err='';render();
+}
+function doLocalLoginFallback(u,p){
   // 1) Managed accounts (Administration → Users): Admin / Secretary logins
   var acct=DB.users.find(function(x){return x.username.toLowerCase()===u.toLowerCase()});
   if(acct){
@@ -632,7 +865,7 @@ function processCampaignDueDeductions(){
 
 function renderLogin(){
   var loginNoticeHtml=isNoticeActive()?'<div class="notice-bar" style="justify-content:center"><span class="nb-icon">📢</span><span>'+esc(DB.notice.text)+'</span></div>':'';
-  return'<div class="login-page">'+loginNoticeHtml+'<div class="login-center"><div class="login-header"><img src="'+IMG_HEADER_FULL+'" alt="'+esc(DB.settings.groupName)+'"></div><div class="login-box"><div class="login-logo"><p>Unity &amp; Progress</p></div>'+(S.err?'<div class="login-err">'+esc(S.err)+'</div>':'')+'<div class="field"><label>Username</label><input id="lu" placeholder="Enter username"></div><div class="field"><label>Password</label><input id="lp" type="password" placeholder="Enter password"></div><button class="btn btn-p" style="width:100%;justify-content:center;margin-top:8px" onclick="doLogin()">Sign In</button></div>'+blueprintFooterHTML()+'</div></div>';
+  return'<div class="login-page">'+loginNoticeHtml+'<div class="login-center"><div class="login-header"><img src="'+IMG_HEADER_FULL+'" alt="'+esc(DB.settings.groupName)+'"></div><div class="login-box"><div class="login-logo"><p>Unity &amp; Progress</p></div>'+(S.err?'<div class="login-err">'+esc(S.err)+'</div>':'')+'<div class="field"><label>Username</label><input id="lu" placeholder="Enter username"'+(S.loginBusy?' disabled':'')+'></div><div class="field"><label>Password</label><input id="lp" type="password" placeholder="Enter password"'+(S.loginBusy?' disabled':'')+'></div><button class="btn btn-p" style="width:100%;justify-content:center;margin-top:8px" onclick="doLogin()"'+(S.loginBusy?' disabled':'')+'>'+(S.loginBusy?'Signing in…':'Sign In')+'</button></div>'+blueprintFooterHTML()+'</div></div>';
 }
 
 function blueprintFooterHTML(){
@@ -670,7 +903,7 @@ function renderShell(){
   else{pages=['my-statement','documents']}
   var labels={'my-statement':'My Statement'};
   var noticeHtml=isNoticeActive()?'<div class="notice-bar"><span class="nb-icon">📢</span><span>'+esc(DB.notice.text)+'</span><span class="nb-meta">Posted by '+esc(DB.notice.postedBy)+'</span></div>':'';
-  return'<div class="app-header"><div class="brand-bar"><img src="'+IMG_HEADER_FULL+'" alt="'+esc(DB.settings.groupName)+'"></div><div class="topnav">'+pages.map(function(p){var label=labels[p]||(p.charAt(0).toUpperCase()+p.slice(1));return'<button class="'+(S.page===p?'active':'')+'" onclick="nav(\''+p+'\')">'+label+'</button>'}).join('')+'<div class="user-area"><span class="pill pill-b">'+esc(currentRoleLabel())+'</span> <b>'+esc(S.user.name)+'</b><button class="btn btn-sm btn-s" onclick="S.modal=\'changePassword\';render()">🔑 Password</button><button class="btn btn-sm btn-s" onclick="S.user=null;S.role=null;render()">Logout</button></div></div></div>'+noticeHtml+'<div class="content">'+renderPage()+blueprintFooterHTML()+'</div>';
+  return'<div class="app-header"><div class="brand-bar"><img src="'+IMG_HEADER_FULL+'" alt="'+esc(DB.settings.groupName)+'"></div><div class="topnav">'+pages.map(function(p){var label=labels[p]||(p.charAt(0).toUpperCase()+p.slice(1));return'<button class="'+(S.page===p?'active':'')+'" onclick="nav(\''+p+'\')">'+label+'</button>'}).join('')+'<div class="user-area"><span class="pill pill-b">'+esc(currentRoleLabel())+'</span> <b>'+esc(S.user.name)+'</b><button id="syncBtn" class="btn btn-sm btn-s" onclick="manualSync()">'+syncStatusLabel()+'</button><button class="btn btn-sm btn-s" onclick="S.modal=\'changePassword\';render()">🔑 Password</button><button class="btn btn-sm btn-s" onclick="S.user=null;S.role=null;render()">Logout</button></div></div></div>'+noticeHtml+'<div class="content">'+renderPage()+blueprintFooterHTML()+'</div>';
 }
 
 function nav(p){S.page=p;S.reportView=null;S.viewMemberId=null;render()}
@@ -1468,14 +1701,44 @@ function downloadLedgerPDF(startYear,startIdx){
     var mCells=r.monthData.map(function(d){
       var over=d.amt>DB.settings.monthlyAmount;
       var amtCell='<td'+(over?' style="background:#e8f9f0;font-weight:bold"':'')+'>'+(d.amt>0?kes(d.amt)+(over?' \u25B2':''):'________')+'</td>';
-      var viaCell='<td style="font-size:8px;white-space:nowrap">'+(d.methods.length?esc(d.methods.join('/')):'&#9744; Cash &#9744; Paybill')+'</td>';
+      var viaCell='<td style="font-size:8px;white-space:nowrap">'+(d.methods.length?esc(d.methods.join('/')):'&#9744;Cash &#9744;Paybill')+'</td>';
       return amtCell+viaCell;
     }).join('');
     var advCell=r.advanceCredit>0?kes(r.advanceCredit)+' \u25B2':'—';
-    return'<tr><td>'+(idx+1)+'</td><td>'+esc(r.member.name)+'</td><td>'+kes(r.deductionBal)+'</td><td>'+kes(r.overallBalance)+'</td>'+mCells+'<td>—</td><td>________</td><td>'+advCell+'</td></tr>';
+    return'<tr><td>'+(idx+1)+'</td><td style="white-space:nowrap">'+esc(r.member.name)+'</td><td>'+kes(r.deductionBal)+'</td><td>'+kes(r.overallBalance)+'</td>'+mCells+'<td>—</td><td>________</td><td>'+advCell+'</td></tr>';
   }).join('');
   var totalsRow='<tr style="font-weight:bold;background:#f5f5f5"><td colspan="2">TOTALS ('+data.totals.totalMembers+' members)</td><td>'+kes(data.totals.totalDeductions)+'</td><td>'+kes(data.totals.totalOutstanding)+'</td>'+data.totals.perMonthCollected.map(function(v){return'<td colspan="2">'+kes(v)+'</td>'}).join('')+'<td>—</td><td>—</td><td>'+kes(data.totals.totalAdvance)+'</td></tr>';
-  var html='<html><head><title>'+esc(DB.settings.groupName)+' - 4-Month Register</title><style>@page{size:landscape}body{font-family:sans-serif;padding:20px;font-size:11px}table{width:100%;border-collapse:collapse;margin:10px 0}th,td{padding:4px 6px;border:1px solid #ddd;text-align:left;font-size:9px}th{background:#f5f5f5;text-align:center}'+pdfPrintFooterCSS(260)+WATERMARK_CSS+'</style></head><body>'+dlHeaderHTML()+'<h3 style="text-align:center">Contribution &amp; Deduction Register</h3><p style="text-align:center;color:#555">Period: '+esc(periodLabel)+' &nbsp;|&nbsp; Monthly Amount: '+kes(DB.settings.monthlyAmount)+' &nbsp;|&nbsp; Generated: '+getToday()+'</p><p style="text-align:center;color:#555;font-size:9px">&#9650; shaded amount = member paid more than the required monthly amount that month. Advance = paid ahead of schedule.</p><table><thead>'+head+'</thead><tbody>'+body+totalsRow+'</tbody></table>'+blueprintFooterHTMLStandalone()+'</body></html>';
+  // This report intentionally does NOT use the shared fixed-position
+  // header/footer (unlike other exports): with 13+ narrow columns across
+  // 4 months, a header/footer pinned to every page risks colliding with
+  // table rows if the estimated header height doesn't exactly match what
+  // the device renders. Instead: the banner shows once at the very top,
+  // the table's own <thead> (which every print engine repeats natively
+  // and reliably) supplies the column headings on every following page,
+  // and the signature footer appears once at the very end. This is far
+  // more robust across different phones/browsers.
+  var html='<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+esc(DB.settings.groupName)+' - 4-Month Register</title><style>'+
+    '@page{size:landscape;margin:10mm}'+
+    'body{font-family:sans-serif;margin:0;padding:14px 16px;font-size:11px}'+
+    'table{width:100%;border-collapse:collapse;margin:10px 0}'+
+    'th,td{padding:3px 5px;border:1px solid #ddd;text-align:left;font-size:8.5px}'+
+    'th{background:#f5f5f5;text-align:center}'+
+    'thead{display:table-header-group}'+
+    'tfoot{display:table-footer-group}'+
+    'tr{page-break-inside:avoid}'+
+    '.print-help{background:#FEF3C7;border:1px solid #F59E0B;border-radius:6px;padding:8px 12px;font-size:12px;color:#7A4A00;margin-bottom:10px}'+
+    '@media print{.print-help{display:none}}'+
+    WATERMARK_CSS+
+  '</style></head><body>'+
+  '<div class="print-help">📄 For best results, make sure <b>Landscape</b> orientation is selected in the print/PDF dialog before saving (tap "Paper size" or "More settings" if it defaults to Portrait).</div>'+
+  dlHeaderHTML()+
+  '<h3 style="text-align:center">Contribution &amp; Deduction Register</h3>'+
+  '<p style="text-align:center;color:#555">Period: '+esc(periodLabel)+' &nbsp;|&nbsp; Monthly Amount: '+kes(DB.settings.monthlyAmount)+' &nbsp;|&nbsp; Generated: '+getToday()+'</p>'+
+  '<p style="text-align:center;color:#555;font-size:9px">&#9650; shaded amount = member paid more than the required monthly amount that month. Advance = paid ahead of schedule.</p>'+
+  '<table><thead>'+head+'</thead><tbody>'+body+totalsRow+'</tbody></table>'+
+  '<div style="page-break-inside:avoid;margin-top:18px">'+signatureBlockHTML()+'</div>'+
+  blueprintFooterHTMLStandalone()+
+  '</body></html>';
   openPrintableDoc(html,'4month_register_'+periodLabel.replace(/[^a-zA-Z0-9]/g,'_'));
 }
 
@@ -1695,7 +1958,8 @@ function renderMyStatement(){
   if(!m)return'<div class="empty">Member not found.</div>';
   var payments=DB.payments.filter(function(p){return p.memberId===mid});
   var now=new Date();
-  var ledger=getMemberLedgerThrough(mid,now.getFullYear(),now.getMonth());
+  var c=getBalanceCutoff();
+  var ledger=getMemberLedgerThrough(mid,c.year,c.monthIndex);
   var unpaid=ledger.months.filter(function(mm){return mm.status!=='Paid'});
   var bal=getMemberTotalBalance(mid);
   var campDebts=[];
@@ -2233,6 +2497,7 @@ function setHouseRep(house,memberId){
   if(!memberId){delete DB.settings.houseReps[house]}
   else{DB.settings.houseReps[house]=parseInt(memberId)}
   save();toast('House Rep updated for '+house);render();
+  syncHouseRepLoginToCloud(house);
 }
 
 var ROLE_OPTIONS=['Member','Officer','Admin'];
@@ -2323,6 +2588,7 @@ function addUser(){
   if(DB.users.find(function(u){return u.username.toLowerCase()===username.toLowerCase()})){toast('That username is already taken');return}
   DB.users.push({id:DB.nid.u++,username:username,password:pwd,name:name,role:role,house:house||null,active:true,memberId:null});
   save();toast('User account created');S.modal=null;render();
+  syncStaffLoginToCloud(DB.users[DB.users.length-1]);
 }
 
 function openEditUserModal(id){S.editUserId=id;S.modal='editUser';render()}
@@ -2344,6 +2610,7 @@ function saveEditUser(){
   if(role==='House Representative'&&!house){toast('Choose which house this representative belongs to');return}
   u.name=name;u.role=role;u.house=house||null;
   save();toast('User updated');S.modal=null;render();
+  syncStaffLoginToCloud(u);
 }
 
 function toggleUserActive(id){
@@ -2351,6 +2618,7 @@ function toggleUserActive(id){
   var activeAdmins=DB.users.filter(function(x){return x.role==='Super Admin'&&x.active});
   if(u.active&&u.role==='Super Admin'&&activeAdmins.length<=1){toast('At least one active Super Admin account must remain');return}
   u.active=!u.active;save();toast(u.active?'User enabled':'User disabled');render();
+  syncStaffLoginToCloud(u);
 }
 
 function deleteUser(id){
@@ -2360,6 +2628,7 @@ function deleteUser(id){
   if(!confirm('Delete the account "'+u.username+'"? This cannot be undone.'))return;
   DB.users=DB.users.filter(function(x){return x.id!==id});
   save();toast('User deleted');render();
+  cloudDisableLogin(u.username);
 }
 
 function openResetPasswordModal(id){S.resetUserId=id;S.modal='resetUserPassword';render()}
@@ -2406,13 +2675,14 @@ function changeMyPassword(){
     var acct=findUserById(S.user.userId);
     if(!acct){toast('Account not found');return}
     if(acct.password!==cur){toast('Current password is incorrect');return}
-    acct.password=p1;save();toast('Password updated');S.modal=null;render();return;
+    acct.password=p1;save();toast('Password updated');S.modal=null;render();syncStaffLoginToCloud(acct);return;
   }
   var member=DB.members.find(function(m){return m.id===S.user.memberId});
   if(!member){toast('Member record not found');return}
   var currentPwd=member.customPassword?member.customPassword:(getPositionRole(member.position)!=='Member'?getOfficerExpectedPassword(member):member.no);
   if(cur.toUpperCase()!==currentPwd.toUpperCase()){toast('Current password is incorrect');return}
   member.customPassword=p1;save();toast('Password updated');S.modal=null;render();
+  syncMemberLoginToCloud(member);
 }
 
 function renderAdminSettings(){
@@ -2427,8 +2697,32 @@ function renderAdminSettings(){
   '<button class="btn btn-p" onclick="downloadBackup()" style="margin-right:6px">⬇ Download Backup (JSON)</button>'+
   '<input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreBackup(this)">'+
   '<button class="btn btn-s" onclick="document.getElementById(\'restoreFile\').click()">⬆ Restore From Backup</button>'+
-  '<p style="font-size:.68rem;color:var(--red);margin-top:8px">⚠ Restoring will completely replace all current data in this browser with the contents of the backup file. This cannot be undone — consider downloading a fresh backup first if unsure.</p>'+
+  '<div class="pnl"><div class="pnl-t"><h3>Cloud Sync</h3></div><div style="padding:14px">'+
+  '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">This device automatically stays in sync with the shared cloud copy. Use the buttons below only if you need to force a direction — for example, moving data that was entered on this device before cloud sync was set up, up to become the live shared version.</p>'+
+  '<button class="btn btn-p" onclick="uploadLocalToCloud()" style="margin-right:6px">⬆ Upload This Device\'s Data (overwrite cloud)</button>'+
+  '<button class="btn btn-s" onclick="manualSync()">⬇ Pull Latest From Cloud (overwrite this device)</button>'+
+  '<br><button class="btn btn-s" style="margin-top:6px" onclick="migrateAllLoginsToCloud()">🔐 Migrate All Logins to Secure Cloud Table</button>'+
+  '<p style="font-size:.68rem;color:var(--red);margin-top:8px">⚠ "Upload" replaces the shared data everyone sees with what\'s on THIS device — anything others have added since will be lost. "Pull" replaces THIS device\'s data with the shared cloud copy. Only use Upload once, right after entering your full member list, to seed the live system.</p>'+
   '</div></div></div>';
+}
+
+function uploadLocalToCloud(){
+  if(!confirm('This will REPLACE the shared live data with what is currently on this device. Any recent changes made elsewhere that are not yet on this device will be lost. Continue?'))return;
+  var now=new Date().toISOString();
+  syncState='syncing';refreshSyncBtn();
+  fetch(SUPABASE_URL+'/rest/v1/group_data?on_conflict=id',{
+    method:'POST',
+    headers:cloudHeaders({'Prefer':'resolution=merge-duplicates'}),
+    body:JSON.stringify({id:CLOUD_ROW_ID,data:sanitizeForCloud(DB),updated_at:now})
+  }).then(function(){
+    lastCloudUpdatedAt=now;syncState='synced';refreshSyncBtn();
+    toast('This device is now the live shared version');
+    migrateAllLoginsToCloud(true);
+  }).catch(function(e){
+    syncState='error';refreshSyncBtn();
+    toast('Upload failed — check your connection and try again');
+    console.warn(e);
+  });
 }
 
 function saveGroupDetails(){
@@ -2874,11 +3168,14 @@ function addMember(){
   var id=DB.nid.m++;var no=getNextMemberNo();
   DB.members.push({id:id,no:no,name:name,idNo:idNo,phone:phone,house:house,dob:dob,joined:joined||getToday(),status:'Active',position:'Member'});
   var msg='Registered: '+no;
+  var newMember={id:id,no:no,name:name,idNo:idNo,phone:phone,house:house,dob:dob,joined:joined||getToday(),status:'Active',position:'Member'};
   if(amount>0){
     DB.payments.push({id:DB.nid.p++,memberId:id,amount:amount,date:payDate,method:method,ref:ref.trim(),month:month||monthLabelForDate(payDate)});
     msg+=' — contribution of '+kes(amount)+' recorded';
   }
   save();S.modal=null;toast(msg);render();
+  if(amount>0)sendPaymentConfirmationSMS(newMember,amount,month||monthLabelForDate(payDate));
+  syncMemberLoginToCloud(newMember);
 }
 
 // One-off utility to bring old-format member numbers (e.g. MATHERI001) up to
@@ -2926,6 +3223,7 @@ function saveMemberEdit(id){
     if(DB.settings.houseReps[h]===id&&(m.house!==h||m.status!=='Active'))delete DB.settings.houseReps[h];
   });
   save();S.modal=null;toast('Member updated');render();
+  syncMemberLoginToCloud(m);
 }
 
 function deleteMember(id){
@@ -2949,6 +3247,7 @@ function recordPayment(){
   if(!memberCanPayMonthly(mid)){toast(m.name+' has outstanding deductions of '+kes(getMemberDeductionBal(mid))+'. Clear deductions first.');return}
   DB.payments.push({id:DB.nid.p++,memberId:mid,amount:amount,date:date||getToday(),method:method,ref:ref,month:month});
   save();S.modal=null;toast('Payment recorded');render();
+  sendPaymentConfirmationSMS(m,amount,month);
 }
 
 function deletePayment(id){
@@ -3164,7 +3463,12 @@ function initCharts(){
 }
 
 render();
-setInterval(function(){if(DB.notice&&!S.modal)render()},30000);
+pullFromCloud(function(changed){if(changed&&!S.modal)render()});
+setInterval(function(){
+  if(pendingSync){pushToCloud();} // prioritize pushing unsynced offline changes first
+  else{pullFromCloud(function(changed){if(changed&&!S.modal)render()});}
+  if(DB.notice&&!S.modal)render();
+},15000);
 </script>
 </body>
 </html>

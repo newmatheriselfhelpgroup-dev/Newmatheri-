@@ -70,7 +70,7 @@ function checkEditPassword(action){
 }
 
 function defaultDB(){return{
-settings:{groupName:'New Matheri Self Help Group',groupEmail:'',paybill:'4298298',account:'0351988',monthlyAmount:100,startMonth:'2024-07',positions:['Chairman','Vice Chairman','Secretary','Assistant Secretary','Treasurer'],positionRoles:{'Chairman':'Officer','Vice Chairman':'Officer','Treasurer':'Officer','Assistant Secretary':'Officer','Secretary':'Officer','Member':'Member'},houses:['Block A','Block B','Block C','Block D','Block E'],houseReps:{},sharedMemberPassword:'matheri@001',sms:{apiKey:'',username:'sandbox',senderId:'NMSHG'}},
+settings:{groupName:'New Matheri Self Help Group',groupEmail:'',paybill:'4298298',account:'0351988',monthlyAmount:100,startMonth:'2024-07',positions:['Chairman','Vice Chairman','Secretary','Assistant Secretary','Treasurer'],positionRoles:{'Chairman':'Officer','Vice Chairman':'Officer','Treasurer':'Officer','Assistant Secretary':'Officer','Secretary':'Officer','Member':'Member'},houses:['Block A','Block B','Block C','Block D','Block E'],houseReps:{},sharedMemberPassword:'matheri@001',sharedHouseRepPassword:'matheri@002',sms:{apiKey:'',username:'sandbox',senderId:'NMSHG'}},
 members:[
 {id:1,no:'NMSHG-M0001',name:'Samuel Wachocho Macharia',idNo:'23456781',phone:'0712345001',house:'Block A',dob:'1980-03-15',joined:'2024-07-01',status:'Active',position:'Chairman'},
 {id:2,no:'NMSHG-M0002',name:'Grace Wanjiru Kamau',idNo:'23456782',phone:'0712345002',house:'Block A',dob:'1985-06-20',joined:'2024-07-01',status:'Active',position:'Secretary'},
@@ -195,15 +195,12 @@ function syncMemberLoginToCloud(member){
   if(!member||!member.idNo)return;
   var posRole=getPositionRole(member.position);
   var isRep=Object.keys(DB.settings.houseReps||{}).some(function(h){return DB.settings.houseReps[h]===member.id});
-  if(posRole==='Member'&&!isRep&&!member.customPassword){
-    // No official role, not a House Rep, and no admin-granted Custom Login
-    // Password — not permitted to log in, so clear any stale cloud login.
-    cloudDisableLogin(member.idNo);
-  }else{
-    var roleLabel=posRole==='Member'?'Member':member.position;
-    var pwd=getMemberExpectedPassword(member);
-    cloudUpsertLogin(member.idNo,pwd,posRole,roleLabel,member.id,null,member.position,member.name);
-  }
+  // Every member — including plain members with no official role — gets a
+  // login: National ID as username, their Custom Login Password if set,
+  // otherwise the shared default Member password.
+  var roleLabel=posRole==='Member'?'Member':member.position;
+  var pwd=getMemberExpectedPassword(member);
+  cloudUpsertLogin(member.idNo,pwd,posRole,roleLabel,member.id,null,member.position,member.name);
   // If this member is currently a house rep anywhere, keep that login in sync too
   Object.keys(DB.settings.houseReps||{}).forEach(function(h){
     if(DB.settings.houseReps[h]===member.id)syncHouseRepLoginToCloud(h);
@@ -214,7 +211,8 @@ function syncHouseRepLoginToCloud(house){
   var repMember=repId?DB.members.find(function(m){return m.id===repId&&m.house===house}):null;
   if(!repMember){return}
   var pwd=getHouseRepExpectedPassword(house,repMember);
-  cloudUpsertLogin(repMember.no,pwd,'HouseRep','House Representative',repMember.id,house,null,repMember.name+' (House Rep: '+house+')');
+  var username=getHouseRepUsername(house,repMember);
+  cloudUpsertLogin(username,pwd,'HouseRep','House Representative',repMember.id,house,null,repMember.name+' (House Rep: '+house+')');
 }
 function syncStaffLoginToCloud(acct){
   if(!acct)return;
@@ -321,6 +319,8 @@ var DB=loadDB()||defaultDB();
   DB.members.forEach(function(m){if(m.customPassword===undefined){m.customPassword='';changed=true}});
   // Migration: single shared default password used by ALL regular members (e.g. matheri@001)
   if(!DB.settings.sharedMemberPassword){DB.settings.sharedMemberPassword='matheri@001';changed=true}
+  // Migration: single shared default password used by ALL House Reps, in every house (e.g. matheri@002)
+  if(!DB.settings.sharedHouseRepPassword){DB.settings.sharedHouseRepPassword='matheri@002';changed=true}
   // Migration: the top system-account role used to be labelled "Admin" — now shown as "Super Admin".
   DB.users.forEach(function(u){if(u.role==='Admin'){u.role='Super Admin';changed=true}if(u.house===undefined){u.house=null;changed=true}});
   if(changed)save();
@@ -770,17 +770,21 @@ function getOfficerExpectedPassword(member){
 // matheri@001) — what differs between members is their username, which is
 // their National ID Number (idNo). The shared password can be changed at any
 // time from Administration → Settings, updating every member at once.
-// House Reps: username = the rep's own Member Number; password =
-// {house name, slugified}@{rep's member no} — e.g. murimi@002.
-// Individual members can still be given a Custom Login Password that
-// overrides the shared default.
+// House Reps: username = "HOUSE NAME(member's National ID Number)", e.g.
+// "Block A(23456781)" — built from the house name as configured and the
+// rep's idNo from the registration form. Password = ONE shared default
+// (e.g. matheri@002) that is identical for every House Rep in every house.
+// Individual members (including House Reps) can still be given a Custom
+// Login Password that overrides the relevant shared default.
 function slugify(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'')}
 function getDefaultMemberPassword(member){
   return(DB.settings.sharedMemberPassword||'matheri@001').toUpperCase();
 }
+function getHouseRepUsername(house,repMember){
+  return house+'('+repMember.idNo+')';
+}
 function getDefaultHouseRepPassword(house,repMember){
-  var houseSlug=slugify(house)||'house';
-  return(houseSlug+'@'+repMember.no).toUpperCase();
+  return(DB.settings.sharedHouseRepPassword||'matheri@002').toUpperCase();
 }
 function getMemberExpectedPassword(member){
   return member.customPassword?member.customPassword.toUpperCase():getDefaultMemberPassword(member);
@@ -837,7 +841,7 @@ function doLocalLoginFallback(u,p){
   var repHouse=Object.keys(DB.settings.houseReps||{}).find(function(h){
     var repId=DB.settings.houseReps[h];
     var rm=repId?DB.members.find(function(m){return m.id===repId&&m.house===h}):null;
-    return rm&&rm.no.toLowerCase()===u.toLowerCase();
+    return rm&&getHouseRepUsername(h,rm).toLowerCase()===u.toLowerCase();
   });
   if(repHouse){
     var repId=DB.settings.houseReps[repHouse];
@@ -846,12 +850,16 @@ function doLocalLoginFallback(u,p){
     if(repPwd===p.toUpperCase()){S.user={name:repMember.name+' (House Rep: '+repHouse+')',role:'HouseRep',roleLabel:'House Representative',house:repHouse,memberId:repMember.id};S.role='HouseRep';S.page='dashboard';S.err='';render();return}
     S.err='Invalid credentials';render();return;
   }
-  // Typed a Member Number that belongs to a real member, but that member isn't
-  // currently assigned as the House Rep for any house — they aren't set up for
-  // House Rep login yet, so point them to their normal Member login instead.
-  var notARep=DB.members.find(function(m){return m.no.toLowerCase()===u.toLowerCase()});
-  if(notARep&&DB.settings.houseReps[notARep.house]!==notARep.id){
-    S.err='You are not currently assigned as a House Representative. Log in with your ID Number ('+notARep.idNo+') instead.';render();return;
+  // Typed a member's National ID Number in the "HOUSE(idNo)" shape, but that
+  // member isn't currently assigned as the House Rep for any house — they
+  // aren't set up for House Rep login yet, so point them to their normal
+  // Member login instead.
+  var repShapeMatch=/^(.*)\(([^)]+)\)$/.exec(u.trim());
+  if(repShapeMatch){
+    var notARep=DB.members.find(function(m){return m.idNo===repShapeMatch[2].trim();});
+    if(notARep&&DB.settings.houseReps[notARep.house]!==notARep.id){
+      S.err='You are not currently assigned as a House Representative. Log in with your ID Number ('+notARep.idNo+') instead.';render();return;
+    }
   }
   var officerMember=DB.members.find(function(m){return m.idNo===u});
   if(officerMember){
@@ -861,16 +869,11 @@ function doLocalLoginFallback(u,p){
       if(p.toUpperCase()===expectedPwd){S.user={name:officerMember.name+' ('+officerMember.position+')',role:posRole,roleLabel:officerMember.position,memberId:officerMember.id,position:officerMember.position};S.role=posRole;S.page='dashboard';S.err='';render();return}
       S.err='Invalid credentials';render();return;
     }
-    if(officerMember.customPassword){
-      // Admin explicitly gave this plain member a Custom Login Password —
-      // that's an explicit grant of access, so let it through.
-      if(p.toUpperCase()===getMemberExpectedPassword(officerMember)){S.user={name:officerMember.name,role:'Member',roleLabel:'Member',memberId:officerMember.id};S.role='Member';S.page='my-statement';S.err='';render();return}
-      S.err='Invalid credentials';render();return;
-    }
-    // Member exists but holds no official role (Officer position), isn't a
-    // House Rep, and has no admin-granted Custom Login Password — plain
-    // members are not permitted to log in.
-    S.err='You have not been assigned an official role (House Representative or Officer), so you do not have login access. Contact the Super Admin.';render();return;
+    // Every plain member can log in with National ID + their Custom Login
+    // Password (if set) or the shared default Member password — view-only
+    // access to their own statement (contributions, balance, advance credit).
+    if(p.toUpperCase()===getMemberExpectedPassword(officerMember)){S.user={name:officerMember.name,role:'Member',roleLabel:'Member',memberId:officerMember.id};S.role='Member';S.page='my-statement';S.err='';render();return}
+    S.err='Invalid credentials';render();return;
   }
   S.err='Invalid credentials';render();
 }
@@ -2567,7 +2570,7 @@ function renderAdminHouses(){
   return'<div class="pnl"><div class="pnl-t"><h3>Manage Houses</h3></div><div style="padding:14px"><div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px">'+DB.settings.houses.map(function(h,i){
     return'<span class="tag">'+esc(h)+' <span class="x" onclick="removeHouse('+i+')">×</span></span>';
   }).join('')+'</div><div style="display:flex;gap:6px"><input id="newHouse" placeholder="New house name" style="border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:.76rem;flex:1"><button class="btn btn-sm btn-p" onclick="addHouse()">Add House</button></div></div></div>'+
-  '<div class="pnl" style="margin-top:12px"><div class="pnl-t"><h3>House Reps (Committee)</h3></div><div style="padding:0"><p style="font-size:.72rem;color:var(--muted);padding:10px 14px 0">Only the assigned rep can log in for a house (username = house name, default password = housename@membernumber, e.g. murimi@002).</p><table><thead><tr><th>House</th><th>Assigned House Rep</th></tr></thead><tbody>'+DB.settings.houses.map(function(h){
+  '<div class="pnl" style="margin-top:12px"><div class="pnl-t"><h3>House Reps (Committee)</h3></div><div style="padding:0"><p style="font-size:.72rem;color:var(--muted);padding:10px 14px 0">Only the assigned rep can log in for a house (username = <b>House Name(their National ID Number)</b>, e.g. Block A(23456781); default password = <b>'+esc((DB.settings.sharedHouseRepPassword||'matheri@002').toLowerCase())+'</b>, the same for every House Rep — change it for everyone at once in Administration → Settings).</p><table><thead><tr><th>House</th><th>Assigned House Rep</th></tr></thead><tbody>'+DB.settings.houses.map(function(h){
     var hMembers=DB.members.filter(function(m){return m.house===h&&m.status==='Active'});
     var currentRepId=DB.settings.houseReps[h]||'';
     return'<tr><td><b>'+esc(h)+'</b></td><td><select onchange="setHouseRep('+JSON.stringify(h)+',this.value)" style="border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:.72rem"><option value="">— None assigned —</option>'+hMembers.map(function(m){return'<option value="'+m.id+'"'+(String(currentRepId)===String(m.id)?' selected':'')+'>'+esc(m.name)+' ('+m.no+')</option>'}).join('')+'</select></td></tr>';
@@ -2586,7 +2589,7 @@ function setHouseRep(house,memberId){
   save();toast('House Rep updated for '+house);render();
   if(prevRepId&&String(prevRepId)!==String(memberId)){
     var prevRep=DB.members.find(function(m){return m.id===prevRepId});
-    if(prevRep)cloudDisableLogin(prevRep.no);
+    if(prevRep)cloudDisableLogin(getHouseRepUsername(house,prevRep));
   }
   syncHouseRepLoginToCloud(house);
 }
@@ -2628,17 +2631,14 @@ function renderAdminUsers(){
   // Every member automatically gets login access using their ID Number as username —
   // no separate account needed. This table lists them live, straight from the
   // Members list, so any newly added member shows up here right away.
-  // Only members with an official role (House Rep or Officer), or a plain
-  // member the admin has explicitly given a Custom Login Password, actually
-  // have login access — everyone else can't log in at all.
+  // ALL members can log in — House Reps and Officers land on the full
+  // dashboard; plain members land on view-only "My Statement".
   var memberList=sortByName(DB.members);
   var memberRows=memberList.map(function(m){
     var isRep=(DB.settings.houseReps[m.house]===m.id);
     var posTier=getPositionRole(m.position);
-    var hasAccess=isRep||posTier!=='Member'||!!m.customPassword;
-    var roleLabel=isRep?'House Representative':(posTier==='Member'?(m.customPassword?'Member (custom access)':'Member'):m.position);
-    var loginUser=isRep?(m.no+' <span style="color:var(--muted);font-size:.68rem">(Member No. — House Rep login)</span>'):esc(m.idNo);
-    if(!hasAccess)return'<tr data-search="'+esc((m.name+' '+m.idNo+' '+m.no+' '+m.house).toLowerCase())+'"><td>'+esc(m.name)+'</td><td>'+loginUser+'</td><td><span class="pill">Member</span></td><td><span style="color:var(--red)">No login access</span></td></tr>';
+    var roleLabel=isRep?'House Representative':(posTier==='Member'?(m.customPassword?'Member (custom password)':'Member'):m.position);
+    var loginUser=isRep?(esc(getHouseRepUsername(m.house,m))+' <span style="color:var(--muted);font-size:.68rem">(House Rep login)</span>'):esc(m.idNo);
     var expectedPwd=isRep?getHouseRepExpectedPassword(m.house,m):(posTier!=='Member'?getOfficerExpectedPassword(m):getMemberExpectedPassword(m));
     var pwdInfo=m.customPassword?'<span style="color:var(--green)">Custom password set</span>':'<span style="color:var(--muted)">Default ('+esc(expectedPwd.toLowerCase())+')</span>';
     return'<tr data-search="'+esc((m.name+' '+m.idNo+' '+m.no+' '+m.house).toLowerCase())+'"><td>'+esc(m.name)+'</td><td>'+loginUser+'</td><td><span class="pill pill-b">'+esc(roleLabel)+'</span></td><td>'+pwdInfo+'</td></tr>';
@@ -2647,7 +2647,7 @@ function renderAdminUsers(){
   '<p style="font-size:.7rem;color:var(--muted);padding:0 14px;margin:8px 0">Create a direct login (username &amp; password) for any role — Super Admin, Chairman, Vice Chairman, Secretary, Assistant Secretary, Treasurer, House Representative or Member. Members can also be given a position (Members tab) or assigned as a House Representative (Houses tab) to log in with their ID Number instead — either way works, use whichever is more convenient.</p>'+
   '<table><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+(rows||'<tr><td colspan="5" style="text-align:center;color:var(--muted)">No user accounts yet</td></tr>')+'</tbody></table></div>'+
   '<div class="pnl"><div class="pnl-t"><h3>Members with Login Access</h3></div>'+
-  '<p style="font-size:.7rem;color:var(--muted);padding:0 14px;margin:8px 0">Only members with an official role — <b>House Representative</b> or an <b>Officer position</b> — can log in. Plain members with no title cannot log in unless you give them a Custom Login Password (Members tab → Edit), which grants access on its own. Members with access log in with their <b>ID Number</b> as username (House Reps use their <b>Member Number</b> instead) and the shared password <b>'+esc((DB.settings.sharedMemberPassword||'matheri@001').toLowerCase())+'</b> — change it for everyone at once in Administration → Settings. This list is generated automatically from the Members tab.</p>'+
+  '<p style="font-size:.7rem;color:var(--muted);padding:0 14px;margin:8px 0">Every member can log in. Plain members (no title) log in with their <b>National ID Number</b> as username and the shared password <b>'+esc((DB.settings.sharedMemberPassword||'matheri@001').toLowerCase())+'</b>, landing on a view-only <b>My Statement</b> page showing only their own contributions, balance and advance credit. Members with an official role — <b>House Representative</b> or an <b>Officer position</b> — get the full dashboard instead. House Reps log in with <b>House Name(their National ID Number)</b> as username, e.g. Block A(23456781), and the shared password <b>'+esc((DB.settings.sharedHouseRepPassword||'matheri@002').toLowerCase())+'</b>. Each shared password can be changed for everyone at once in Administration → Settings, or an individual member can be given their own Custom Login Password (Members tab → Edit). This list is generated automatically from the Members tab.</p>'+
   '<div class="field" style="max-width:320px;margin:0 14px 10px"><input placeholder="Search by name, ID no., or house..." oninput="filterAdminMemberUsers(this)"></div>'+
   '<table id="memberUsersTable"><thead><tr><th>Name</th><th>Login (ID No.)</th><th>Role</th><th>Password</th></tr></thead><tbody>'+(memberRows||'<tr><td colspan="4" style="text-align:center;color:var(--muted)">No members added yet</td></tr>')+'</tbody></table></div>';
 }
@@ -2788,9 +2788,9 @@ function renderAdminSettings(){
   '<input type="file" id="setGroupLogo" accept="image/*" style="display:none" onchange="uploadGroupLogo(this)"><button type="button" class="btn btn-s" onclick="document.getElementById(\'setGroupLogo\').click()">⬆ '+(DB.settings.logo?'Change Logo':'Upload Logo')+'</button></div>'+
   '<button class="btn btn-p" onclick="saveGroupDetails()">Save</button><p style="font-size:.68rem;color:var(--muted);margin-top:6px">The group email appears on the letterhead of documents written in Documents → Letters.</p></div></div>'+
   '<div class="pnl"><div class="pnl-t"><h3>Monthly Contribution</h3></div><div style="padding:14px"><div class="field"><label>Amount (KES)</label><input id="setAmt" type="number" value="'+DB.settings.monthlyAmount+'"></div><button class="btn btn-p" onclick="DB.settings.monthlyAmount=parseInt(document.getElementById(\'setAmt\').value)||100;save();toast(\'Updated\');render()">Update</button></div></div>'+
-  '<div class="pnl"><div class="pnl-t"><h3>Default Login Passwords</h3></div><div style="padding:14px"><div class="field"><label>Shared Default Password (for ALL Members)</label><input id="setSharedPwd" value="'+esc(DB.settings.sharedMemberPassword||'matheri@001')+'"></div><button class="btn btn-p" onclick="savePasswordPrefix()">Save</button>'+
-  '<p style="font-size:.68rem;color:var(--muted);margin-top:8px">Every member without a Custom Login Password logs in with their own <b>ID Number</b> as username and this <b>same password</b> for all '+DB.members.length+' members (e.g. '+esc((DB.settings.sharedMemberPassword||'matheri@001').toLowerCase())+'). House Reps log in with their own <b>Member Number</b> as username and <b>housename@{member no}</b> as password (e.g. murimi@002).</p>'+
-  '<p style="font-size:.68rem;color:var(--muted);margin-top:6px">Changing this password updates every member at once — no need to tell each member individually unless they\'ve been given a Custom Login Password (Members tab → Edit), which always overrides the shared default. Use Administration → Users, or the "Change Password" button while logged in, to set/reset passwords per person over time.</p></div></div>'+
+  '<div class="pnl"><div class="pnl-t"><h3>Default Login Passwords</h3></div><div style="padding:14px"><div class="field"><label>Shared Default Password (for ALL Members)</label><input id="setSharedPwd" value="'+esc(DB.settings.sharedMemberPassword||'matheri@001')+'"></div><div class="field"><label>Shared Default Password (for ALL House Reps)</label><input id="setSharedRepPwd" value="'+esc(DB.settings.sharedHouseRepPassword||'matheri@002')+'"></div><button class="btn btn-p" onclick="savePasswordPrefix()">Save</button>'+
+  '<p style="font-size:.68rem;color:var(--muted);margin-top:8px">Every member without a Custom Login Password logs in with their own <b>National ID Number</b> as username and the Members password for all '+DB.members.length+' members (e.g. '+esc((DB.settings.sharedMemberPassword||'matheri@001').toLowerCase())+'). House Reps log in with <b>House Name(their National ID Number)</b> as username (e.g. Block A(23456781)) and the House Reps password above — the same for every House Rep, in every house.</p>'+
+  '<p style="font-size:.68rem;color:var(--muted);margin-top:6px">Changing either password updates everyone in that group at once — no need to tell each person individually unless they\'ve been given a Custom Login Password (Members tab → Edit), which always overrides the shared default. Use Administration → Users, or the "Change Password" button while logged in, to set/reset passwords per person over time.</p></div></div>'+
   '<div class="pnl"><div class="pnl-t"><h3>SMS Settings</h3></div><div style="padding:14px"><div class="field"><label>API Key</label><input id="sk" type="password" value="'+esc(DB.settings.sms.apiKey)+'"></div><div class="field"><label>Username</label><input id="su" value="'+esc(DB.settings.sms.username)+'"></div><div class="field"><label>Sender ID</label><input id="si" value="'+esc(DB.settings.sms.senderId)+'"></div><button class="btn btn-p" onclick="saveSMS()">Save Config</button><p style="font-size:.68rem;color:var(--muted);margin-top:6px">Without API key, SMS opens phone app instead.</p></div></div>'+
   '<div class="pnl"><div class="pnl-t"><h3>Backup &amp; Restore</h3></div><div style="padding:14px">'+
   '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">Download a full backup of all members, contributions, campaigns, deductions and settings as a JSON file. Use this to move data between devices/browsers, or to seed a newly deployed copy of this app with your existing records.</p>'+
@@ -2844,10 +2844,12 @@ function saveGroupDetails(){
 
 function savePasswordPrefix(){
   var pwd=document.getElementById('setSharedPwd').value.trim();
-  if(!pwd){toast('Password cannot be empty');return}
+  var repPwd=document.getElementById('setSharedRepPwd').value.trim();
+  if(!pwd||!repPwd){toast('Passwords cannot be empty');return}
   DB.settings.sharedMemberPassword=pwd;
-  save();toast('Shared default password updated — every member now logs in with "'+pwd.toUpperCase()+'" (using their own ID Number as username)');render();
-  // Push the new shared password for anyone still using the default (no custom password) to the cloud
+  DB.settings.sharedHouseRepPassword=repPwd;
+  save();toast('Shared default passwords updated — Members now use "'+pwd.toUpperCase()+'" and House Reps now use "'+repPwd.toUpperCase()+'"');render();
+  // Push the new shared passwords for anyone still using the default (no custom password) to the cloud
   DB.members.forEach(function(m){if(!m.customPassword)syncMemberLoginToCloud(m)});
   Object.keys(DB.settings.houseReps||{}).forEach(function(h){syncHouseRepLoginToCloud(h)});
 }
@@ -3058,7 +3060,7 @@ function renderEditMemberModal(){
   var m=DB.members.find(function(x){return x.id===S.editMemberId});
   if(!m)return'<div class="mbox"><p>Not found</p></div>';
   var isHouseRep=DB.settings.houseReps[m.house]===m.id;
-  return'<div class="mbox"><div class="mhd"><h3>Edit: '+esc(m.name)+'</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div><div class="fg"><div class="field"><label>Member Number</label><input id="eNo" value="'+esc(m.no)+'">'+(isHouseRep?'<p style="font-size:.64rem;color:var(--red);margin:3px 0 0">⚠ This member is a House Rep — their login <b>username</b> is this Member Number, and it also appears in their default password (currently '+esc(getDefaultHouseRepPassword(m.house,m).toLowerCase())+'). Changing it changes how they log in, unless a Custom Login Password is set below.</p>':'<p style="font-size:.64rem;color:var(--muted);margin:3px 0 0">Regular members log in with their National ID as username and the shared default password (Administration → Settings), not this number.</p>')+'</div><div class="field"><label>Full Name</label><input id="eName" value="'+esc(m.name)+'"></div><div class="field"><label>House</label><select id="eHouse">'+DB.settings.houses.map(function(h){return'<option'+(m.house===h?' selected':'')+'>'+h+'</option>'}).join('')+'</select></div><div class="field"><label>National ID</label><input id="eId" value="'+esc(m.idNo)+'"></div><div class="field"><label>Phone</label><input id="ePhone" value="'+esc(m.phone)+'"></div><div class="field"><label>Date of Birth</label><input id="eDob" type="date" value="'+m.dob+'"></div><div class="field"><label>Date Joined</label><input id="eJoined" type="date" value="'+m.joined+'"></div><div class="field"><label>Status</label><select id="eStatus"><option'+(m.status==='Active'?' selected':'')+'>Active</option><option'+(m.status==='Inactive'?' selected':'')+'>Inactive</option></select></div><div class="field"><label>Position</label><select id="ePosition"><option>Member</option>'+DB.settings.positions.map(function(p){return'<option'+(m.position===p?' selected':'')+'>'+p+'</option>'}).join('')+'</select></div>'+
+  return'<div class="mbox"><div class="mhd"><h3>Edit: '+esc(m.name)+'</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div><div class="fg"><div class="field"><label>Member Number</label><input id="eNo" value="'+esc(m.no)+'">'+(isHouseRep?'<p style="font-size:.64rem;color:var(--red);margin:3px 0 0">⚠ This member is a House Rep — their login <b>username</b> is '+esc(getHouseRepUsername(m.house,m))+' (House Name + their National ID), with the default password currently '+esc(getDefaultHouseRepPassword(m.house,m).toLowerCase())+'. Changing their House or National ID changes their login username, unless a Custom Login Password is set below.</p>':'<p style="font-size:.64rem;color:var(--muted);margin:3px 0 0">Regular members log in with their National ID as username and the shared default password (Administration → Settings), not this number.</p>')+'</div><div class="field"><label>Full Name</label><input id="eName" value="'+esc(m.name)+'"></div><div class="field"><label>House</label><select id="eHouse">'+DB.settings.houses.map(function(h){return'<option'+(m.house===h?' selected':'')+'>'+h+'</option>'}).join('')+'</select></div><div class="field"><label>National ID</label><input id="eId" value="'+esc(m.idNo)+'"></div><div class="field"><label>Phone</label><input id="ePhone" value="'+esc(m.phone)+'"></div><div class="field"><label>Date of Birth</label><input id="eDob" type="date" value="'+m.dob+'"></div><div class="field"><label>Date Joined</label><input id="eJoined" type="date" value="'+m.joined+'"></div><div class="field"><label>Status</label><select id="eStatus"><option'+(m.status==='Active'?' selected':'')+'>Active</option><option'+(m.status==='Inactive'?' selected':'')+'>Inactive</option></select></div><div class="field"><label>Position</label><select id="ePosition"><option>Member</option>'+DB.settings.positions.map(function(p){return'<option'+(m.position===p?' selected':'')+'>'+p+'</option>'}).join('')+'</select></div>'+
   '<div class="field" style="grid-column:1/-1"><label>Custom Login Password (optional)</label><input id="eCustomPwd" value="'+esc(m.customPassword||'')+'" placeholder="Leave blank to use the default (shared password / House Rep password)"><p style="font-size:.64rem;color:var(--muted);margin:3px 0 0">If set, this overrides the default login password for this member/House Rep/Officer.</p></div>'+
   '</div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Cancel</button><button class="btn btn-p" onclick="saveMemberEdit('+m.id+')">Save Changes</button></div></div>';
 }

@@ -130,11 +130,19 @@ function cloudHeaders(extra){
   return h;
 }
 var pendingSync=false;
+// Cloud pull/push is now gated behind real credentials (see login_check /
+// get_group_data_secure / save_group_data_secure in Supabase) — the RLS
+// policies on group_data no longer allow the anon key to read or write it
+// directly, so every cloud request has to carry a verified login.
+var SESSION_U=null,SESSION_P=null;
 function sanitizeForCloud(db){
-  var clone=JSON.parse(JSON.stringify(db));
-  (clone.users||[]).forEach(function(u){u.password=''});
-  (clone.members||[]).forEach(function(m){m.customPassword=''});
-  return clone;
+  // Previously this stripped passwords before every cloud push, because the
+  // group_data table was openly readable — that was a workaround for the
+  // security hole, not a real fix. Now that the table is locked down (RLS
+  // denies direct reads/writes; only the credential-checked RPCs can touch
+  // it), passwords need to actually be present in the cloud copy for
+  // login_check() to validate custom member passwords and staff accounts.
+  return JSON.parse(JSON.stringify(db));
 }
 function mergeLocalSecrets(oldDB,newDB){
   if(!oldDB)return newDB;
@@ -153,6 +161,7 @@ function mergeLocalSecrets(oldDB,newDB){
 function pushToCloud(){
   if(cloudSyncTimer)clearTimeout(cloudSyncTimer);
   cloudSyncTimer=setTimeout(function(){
+    if(!SESSION_U){return} // not logged in — nothing to authenticate the write with
     var now=new Date().toISOString();
     if(navigator.onLine===false){
       pendingSync=true;
@@ -160,11 +169,12 @@ function pushToCloud(){
       return;
     }
     if(typeof syncState!=='undefined'){syncState='syncing';refreshSyncBtn()}
-    fetch(SUPABASE_URL+'/rest/v1/group_data?on_conflict=id',{
+    fetch(SUPABASE_URL+'/rest/v1/rpc/save_group_data_secure',{
       method:'POST',
-      headers:cloudHeaders({'Prefer':'resolution=merge-duplicates'}),
-      body:JSON.stringify({id:CLOUD_ROW_ID,data:sanitizeForCloud(DB),updated_at:now})
-    }).then(function(){
+      headers:cloudHeaders(),
+      body:JSON.stringify({p_username:SESSION_U,p_password:SESSION_P,p_data:sanitizeForCloud(DB)})
+    }).then(function(r){
+      if(!r.ok)throw new Error('save rejected');
       lastCloudUpdatedAt=now;pendingSync=false;
       if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
     }).catch(function(e){
@@ -227,13 +237,17 @@ function migrateAllLoginsToCloud(skipConfirm){
   toast('Migrating '+DB.users.length+' staff accounts and '+DB.members.length+' member logins — this runs in the background over the next few seconds');
 }
 function pullFromCloud(cb){
-  fetch(SUPABASE_URL+'/rest/v1/group_data?id=eq.'+CLOUD_ROW_ID+'&select=data,updated_at',{headers:cloudHeaders()})
+  if(!SESSION_U){if(cb)cb(false);return} // not logged in — nothing to authenticate the read with
+  fetch(SUPABASE_URL+'/rest/v1/rpc/get_group_data_secure',{
+    method:'POST',headers:cloudHeaders(),
+    body:JSON.stringify({p_username:SESSION_U,p_password:SESSION_P})
+  })
     .then(function(r){return r.json()})
-    .then(function(rows){
-      if(rows&&rows.length&&rows[0]&&rows[0].data){
-        if(rows[0].updated_at!==lastCloudUpdatedAt){
-          lastCloudUpdatedAt=rows[0].updated_at;
-          DB=mergeLocalSecrets(DB,rows[0].data);
+    .then(function(result){
+      if(result&&result.data){
+        if(result.updated_at!==lastCloudUpdatedAt){
+          lastCloudUpdatedAt=result.updated_at;
+          DB=mergeLocalSecrets(DB,result.data);
           localStorage.setItem(V,JSON.stringify(DB));
           if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
           if(cb)cb(true);
@@ -285,12 +299,16 @@ function syncStatusLabel(){
 function refreshSyncBtn(){var b=document.getElementById('syncBtn');if(b)b.textContent=syncStatusLabel()}
 function manualSync(){
   syncState='syncing';refreshSyncBtn();
-  fetch(SUPABASE_URL+'/rest/v1/group_data?id=eq.'+CLOUD_ROW_ID+'&select=data,updated_at',{headers:cloudHeaders()})
+  if(!SESSION_U){syncState='error';refreshSyncBtn();return}
+  fetch(SUPABASE_URL+'/rest/v1/rpc/get_group_data_secure',{
+    method:'POST',headers:cloudHeaders(),
+    body:JSON.stringify({p_username:SESSION_U,p_password:SESSION_P})
+  })
     .then(function(r){return r.json()})
-    .then(function(rows){
-      if(rows&&rows.length&&rows[0]&&rows[0].data){
-        lastCloudUpdatedAt=rows[0].updated_at;
-        DB=mergeLocalSecrets(DB,rows[0].data);
+    .then(function(result){
+      if(result&&result.data){
+        lastCloudUpdatedAt=result.updated_at;
+        DB=mergeLocalSecrets(DB,result.data);
         localStorage.setItem(V,JSON.stringify(DB));
         syncState='synced';
         toast('Updated with latest shared data');
@@ -806,9 +824,11 @@ function doLogin(){
     }else{
       doLocalLoginFallback(u,p); // no cloud match — fall back to local check (covers pre-migration accounts)
     }
+    if(S.user){SESSION_U=u;SESSION_P=p;} // remember creds in memory only, to authenticate later cloud sync calls
   }).catch(function(){
     S.loginBusy=false;
     doLocalLoginFallback(u,p); // offline — fall back to local check
+    if(S.user){SESSION_U=u;SESSION_P=p;}
   });
 }
 function applyLoginSession(row){
@@ -878,9 +898,21 @@ function doLocalLoginFallback(u,p){
   S.err='Invalid credentials';render();
 }
 
+// SECURITY: the full group dataset is only ever pulled from the cloud AFTER
+// a successful login (checked here, on every render). Nothing loads it on
+// page open, so simply visiting the link — without logging in — gets you
+// nothing but the login screen; no member, contribution, or balance data
+// ever reaches the browser first.
+var cloudSyncStarted=false;
+function startCloudSyncIfNeeded(){
+  if(cloudSyncStarted||!S.user)return;
+  cloudSyncStarted=true;
+  pullFromCloud(function(changed){if(changed&&!S.modal)render()});
+}
 function render(){
   var app=document.getElementById('app');
   if(!S.user){app.innerHTML=renderLogin();return}
+  startCloudSyncIfNeeded();
   processCampaignDueDeductions();
   app.innerHTML=renderShell()+(S.modal?renderModal():'')+(S.toast?'<div class="toast">'+esc(S.toast)+'</div>':'');
   if(S.page==='dashboard'&&(S.role==='Admin'||S.role==='Secretary'||S.role==='Officer'))initCharts();
@@ -954,7 +986,7 @@ function renderShell(){
   else{pages=['my-statement','documents']}
   var labels={'my-statement':'My Statement'};
   var noticeHtml=isNoticeActive()?'<div class="notice-bar"><span class="nb-icon">📢</span><span>'+esc(DB.notice.text)+'</span><span class="nb-meta">Posted by '+esc(DB.notice.postedBy)+'</span></div>':'';
-  return'<div class="app-header"><div class="brand-bar"><img src="'+IMG_HEADER_FULL+'" alt="'+esc(DB.settings.groupName)+'"></div><div class="topnav">'+pages.map(function(p){var label=labels[p]||(p.charAt(0).toUpperCase()+p.slice(1));return'<button class="'+(S.page===p?'active':'')+'" onclick="nav(\''+p+'\')">'+label+'</button>'}).join('')+'<div class="user-area"><span class="pill pill-b">'+esc(currentRoleLabel())+'</span> <b>'+esc(S.user.name)+'</b><button id="syncBtn" class="btn btn-sm btn-s" onclick="manualSync()">'+syncStatusLabel()+'</button><button class="btn btn-sm btn-s" onclick="S.modal=\'changePassword\';render()">🔑 Password</button><button class="btn btn-sm btn-s" onclick="S.user=null;S.role=null;render()">Logout</button></div></div></div>'+noticeHtml+'<div class="content">'+renderPage()+blueprintFooterHTML()+'</div>';
+  return'<div class="app-header"><div class="brand-bar"><img src="'+IMG_HEADER_FULL+'" alt="'+esc(DB.settings.groupName)+'"></div><div class="topnav">'+pages.map(function(p){var label=labels[p]||(p.charAt(0).toUpperCase()+p.slice(1));return'<button class="'+(S.page===p?'active':'')+'" onclick="nav(\''+p+'\')">'+label+'</button>'}).join('')+'<div class="user-area"><span class="pill pill-b">'+esc(currentRoleLabel())+'</span> <b>'+esc(S.user.name)+'</b><button id="syncBtn" class="btn btn-sm btn-s" onclick="manualSync()">'+syncStatusLabel()+'</button><button class="btn btn-sm btn-s" onclick="S.modal=\'changePassword\';render()">🔑 Password</button><button class="btn btn-sm btn-s" onclick="S.user=null;S.role=null;cloudSyncStarted=false;SESSION_U=null;SESSION_P=null;render()">Logout</button></div></div></div>'+noticeHtml+'<div class="content">'+renderPage()+blueprintFooterHTML()+'</div>';
 }
 
 function nav(p){S.page=p;S.reportView=null;S.viewMemberId=null;render()}
@@ -2816,11 +2848,12 @@ function uploadLocalToCloud(){
   downloadBackup(); // automatic safety snapshot before overwriting the shared copy
   var now=new Date().toISOString();
   syncState='syncing';refreshSyncBtn();
-  fetch(SUPABASE_URL+'/rest/v1/group_data?on_conflict=id',{
+  fetch(SUPABASE_URL+'/rest/v1/rpc/save_group_data_secure',{
     method:'POST',
-    headers:cloudHeaders({'Prefer':'resolution=merge-duplicates'}),
-    body:JSON.stringify({id:CLOUD_ROW_ID,data:sanitizeForCloud(DB),updated_at:now})
-  }).then(function(){
+    headers:cloudHeaders(),
+    body:JSON.stringify({p_username:SESSION_U,p_password:SESSION_P,p_data:sanitizeForCloud(DB)})
+  }).then(function(r){
+    if(!r.ok)throw new Error('save rejected');
     lastCloudUpdatedAt=now;syncState='synced';refreshSyncBtn();
     toast('This device is now the live shared version — a safety copy was also downloaded');
     migrateAllLoginsToCloud(true);
@@ -3594,8 +3627,8 @@ function initCharts(){
 }
 
 render();
-pullFromCloud(function(changed){if(changed&&!S.modal)render()});
 setInterval(function(){
+  if(!S.user)return; // logged out — never sync or touch cloud data while on the login screen
   if(pendingSync){pushToCloud();} // prioritize pushing unsynced offline changes first
   else{pullFromCloud(function(changed){if(changed&&!S.modal)render()});}
   if(DB.notice&&!S.modal)render();

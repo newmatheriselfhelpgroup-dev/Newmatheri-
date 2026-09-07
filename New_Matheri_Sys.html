@@ -174,13 +174,21 @@ function pushToCloud(){
       headers:cloudHeaders(),
       body:JSON.stringify({p_username:SESSION_U,p_password:SESSION_P,p_data:sanitizeForCloud(DB)})
     }).then(function(r){
-      if(!r.ok)throw new Error('save rejected');
+      return r.text().then(function(txt){
+        if(!r.ok){
+          var parsed=null;try{parsed=txt?JSON.parse(txt):null}catch(e){}
+          var msg=(parsed&&(parsed.message||parsed.error||parsed.hint))||txt||('HTTP '+r.status);
+          throw new Error(msg);
+        }
+      });
+    }).then(function(){
       lastCloudUpdatedAt=now;pendingSync=false;
       if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
     }).catch(function(e){
       console.warn('Cloud sync failed, will retry when back online:',e);
       pendingSync=true;
       if(typeof syncState!=='undefined'){syncState=(navigator.onLine===false?'offline':'error');refreshSyncBtn()}
+      toast('Sync failed: '+e.message);
     });
   },1200);
 }
@@ -299,12 +307,21 @@ function syncStatusLabel(){
 function refreshSyncBtn(){var b=document.getElementById('syncBtn');if(b)b.textContent=syncStatusLabel()}
 function manualSync(){
   syncState='syncing';refreshSyncBtn();
-  if(!SESSION_U){syncState='error';refreshSyncBtn();return}
+  if(!SESSION_U){syncState='error';refreshSyncBtn();toast('Not logged in — cannot sync');return}
   fetch(SUPABASE_URL+'/rest/v1/rpc/get_group_data_secure',{
     method:'POST',headers:cloudHeaders(),
     body:JSON.stringify({p_username:SESSION_U,p_password:SESSION_P})
   })
-    .then(function(r){return r.json()})
+    .then(function(r){
+      return r.text().then(function(txt){
+        var parsed=null;try{parsed=txt?JSON.parse(txt):null}catch(e){}
+        if(!r.ok){
+          var msg=(parsed&&(parsed.message||parsed.error||parsed.hint))||txt||('HTTP '+r.status);
+          throw new Error(msg);
+        }
+        return parsed;
+      });
+    })
     .then(function(result){
       if(result&&result.data){
         lastCloudUpdatedAt=result.updated_at;
@@ -320,7 +337,7 @@ function manualSync(){
         refreshSyncBtn();
       }
     })
-    .catch(function(e){syncState='error';toast('Sync failed — check your connection');refreshSyncBtn();console.warn(e)});
+    .catch(function(e){syncState='error';toast('Sync failed: '+e.message);refreshSyncBtn();console.warn(e)});
 }
 var DB=loadDB()||defaultDB();
 // Migration: ensure users table exists for DBs saved before user management was added
@@ -832,13 +849,18 @@ function doLogin(){
   });
 }
 function applyLoginSession(row){
+  // login_check() in Supabase returns member_id as text (Postgres ->> always
+  // yields text) — but every member.id in this app is a JS number, so it
+  // must be converted back or every id===... lookup (My Statement, ID card,
+  // etc.) silently fails to find the member even though login succeeded.
+  var mid=(row.member_id!=null&&row.member_id!==''&&!isNaN(row.member_id))?Number(row.member_id):row.member_id;
   if(row.role==='HouseRep'){
-    S.user={name:row.display_name,role:'HouseRep',roleLabel:'House Representative',house:row.house,memberId:row.member_id};
+    S.user={name:row.display_name,role:'HouseRep',roleLabel:'House Representative',house:row.house,memberId:mid};
     S.role='HouseRep';S.page='dashboard';S.err='';render();return;
   }
-  if(row.member_id){
+  if(mid){
     var posRole=row.role;
-    S.user={name:row.display_name,role:posRole,roleLabel:row.role_label,memberId:row.member_id,position:row.position||undefined};
+    S.user={name:row.display_name,role:posRole,roleLabel:row.role_label,memberId:mid,position:row.position||undefined};
     S.role=posRole;S.page=(posRole==='Member')?'my-statement':'dashboard';S.err='';render();return;
   }
   // Staff account (Admin/Secretary/etc.)
@@ -913,9 +935,14 @@ function render(){
   var app=document.getElementById('app');
   if(!S.user){app.innerHTML=renderLogin();return}
   startCloudSyncIfNeeded();
-  processCampaignDueDeductions();
-  app.innerHTML=renderShell()+(S.modal?renderModal():'')+(S.toast?'<div class="toast">'+esc(S.toast)+'</div>':'');
-  if(S.page==='dashboard'&&(S.role==='Admin'||S.role==='Secretary'||S.role==='Officer'))initCharts();
+  try{
+    processCampaignDueDeductions();
+    app.innerHTML=renderShell()+(S.modal?renderModal():'')+(S.toast?'<div class="toast">'+esc(S.toast)+'</div>':'');
+    if(S.page==='dashboard'&&(S.role==='Admin'||S.role==='Secretary'||S.role==='Officer'))initCharts();
+  }catch(e){
+    console.error('Render error:',e);
+    app.innerHTML='<div style="padding:20px;font-family:monospace;font-size:.72rem;white-space:pre-wrap;color:#b00020;background:#fff5f5;border:1px solid #f0b0b0;margin:10px;border-radius:8px">⚠ Something went wrong displaying this page.\n\nPlease screenshot this and send it back:\n\n'+esc(e.message||String(e))+'\n\n'+esc((e.stack||'').split('\n').slice(0,5).join('\n'))+'</div>';
+  }
 }
 
 function processCampaignDueDeductions(){

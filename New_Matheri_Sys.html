@@ -101,7 +101,7 @@ expenses:[
 {id:1,type:'Welfare',amount:200,reason:'Hospital bill',beneficiary:'Esther Njeri',requestedBy:'Jane Wambui',approvedBy:'Admin',date:'2026-06-15',status:'Approved',paidFrom:'Cash'},
 {id:2,type:'Transport',amount:150,reason:'Committee meeting',beneficiary:'Peter Mwangi',requestedBy:'Jane Wambui',approvedBy:'Admin',date:'2026-06-01',status:'Approved',paidFrom:'Cash'},
 {id:3,type:'Supplies',amount:150,reason:'Stationery',beneficiary:'Group',requestedBy:'Jane Wambui',approvedBy:'',date:'2026-07-20',status:'Pending',paidFrom:'Cash'}],
-sessions:[{id:1,date:'2026-07-08',startedBy:'Jane Wambui',startedAt:'08:05',closedAt:'',status:'active'}],
+sessions:[],
 smsLog:[],
 documents:{constitution:'',rules:'',minutes:[],letters:[]},
 bankDeposits:[],
@@ -368,6 +368,7 @@ if(!DB.documents.letters)DB.documents.letters=[];
 if(!('groupEmail' in DB.settings))DB.settings.groupEmail='';
 if(!('groupPhone' in DB.settings))DB.settings.groupPhone='';
 if(!('logo' in DB.settings))DB.settings.logo='';
+if(!('stamp' in DB.settings))DB.settings.stamp='';
 if(!DB.bankDeposits)DB.bankDeposits=[];
 if(!DB.assets)DB.assets=[];
 if(!DB.assetIncome)DB.assetIncome=[];
@@ -381,6 +382,23 @@ if(!DB.nid.bd)DB.nid.bd=1;
 if(!DB.nid.let)DB.nid.let=1;
 if(!DB.dependents)DB.dependents=[];
 if(!DB.nid.dep)DB.nid.dep=1;
+// ─── AUTO-DEDUCTION SCHEMA ───
+// deductionPayments = money recovered from a member's monthly contribution to
+// settle a NON-campaign deduction. (Campaign-linked recoveries are written into
+// campaignPayments with viaDeduction:true so the campaign itself shows as paid.)
+if(!DB.deductionPayments)DB.deductionPayments=[];
+if(!DB.nid.dp)DB.nid.dp=DB.deductionPayments.reduce(function(m,r){return Math.max(m,r.id||0)},0)+1;
+// ─── COLLECTION SESSIONS ───
+// A session is a single sitting (e.g. a meeting) during which contributions are
+// collected. Opening one lets every monthly contribution recorded while it's
+// active be tagged, so it can later be printed as one list — who paid, how much,
+// which month it covered, and where the money was allocated.
+if(!DB.sessions)DB.sessions=[];
+if(!DB.nid.s)DB.nid.s=DB.sessions.reduce(function(m,r){return Math.max(m,r.id||0)},0)+1;
+DB.sessions.forEach(function(ses){if(ses.closedBy===undefined)ses.closedBy=''});
+if(!('autoDeduct' in DB.settings))DB.settings.autoDeduct=true;
+// Older payments were recorded before the split existed — their full amount went to contributions.
+DB.payments.forEach(function(p){if(p.gross===undefined){p.gross=p.amount;p.deducted=0}});
 DB.expenses.forEach(function(e){if(!e.paidFrom)e.paidFrom='Cash'});
 DB.bankDeposits.forEach(function(d){if(!d.type)d.type='Deposit'});
 
@@ -452,6 +470,216 @@ function getMemberBalance(mid){
 function getMemberDeductionBal(mid){return DB.deductions.filter(function(d){return d.memberId===mid&&d.status==='Outstanding'}).reduce(function(s,d){return s+(d.amount-d.paid)},0)}
 function getMemberTotalBalance(mid){return getMemberBalance(mid)+getMemberDeductionBal(mid)}
 function memberCanPayMonthly(mid){return getMemberDeductionBal(mid)<=0}
+
+// ─── AUTO-DEDUCTION FROM THE MONTHLY CONTRIBUTION ───
+// When a member owes a deduction (typically their unpaid share of an "other
+// contribution" / campaign), the money they hand in as their monthly
+// contribution is used to settle that debt FIRST — oldest debt first. Whatever
+// is left over is what actually counts towards their monthly contributions.
+// The money never leaves the group's books: the deducted part is re-recorded as
+// a campaign payment (campaign debts) or a deductionPayment (other debts), so
+// cash-in-hand, bank and income totals stay exactly the same.
+function autoDeductEnabled(){return DB.settings.autoDeduct!==false}
+
+function applyAutoDeductions(payment){
+  // A restored backup or a cloud pull can hand us a DB saved before this feature existed.
+  if(!DB.deductionPayments)DB.deductionPayments=[];
+  if(!DB.nid.dp)DB.nid.dp=1;
+  var gross=payment.amount;
+  payment.gross=gross;payment.deducted=0;payment.deductionItems=[];
+  if(!autoDeductEnabled())return 0;
+  var pool=gross;
+  var owed=DB.deductions.filter(function(d){return d.memberId===payment.memberId&&d.status==='Outstanding'&&(d.amount-d.paid)>0})
+    .sort(function(a,b){return String(a.date||'').localeCompare(String(b.date||''))||a.id-b.id});
+  owed.forEach(function(d){
+    if(pool<=0)return;
+    var take=Math.min(d.amount-d.paid,pool);
+    if(take<=0)return;
+    pool-=take;
+    d.paid+=take;
+    var cleared=d.paid>=d.amount;
+    if(cleared)d.status='Cleared';
+    if(d.source==='campaign'&&d.campaignId){
+      DB.campaignPayments.push({id:DB.nid.cp++,campaignId:d.campaignId,memberId:payment.memberId,amount:take,date:payment.date,method:payment.method,ref:payment.ref,viaDeduction:true,deductionId:d.id});
+    }else{
+      DB.deductionPayments.push({id:DB.nid.dp++,deductionId:d.id,memberId:payment.memberId,amount:take,date:payment.date,method:payment.method,ref:payment.ref,viaDeduction:true,reason:d.reason});
+    }
+    payment.deductionItems.push({deductionId:d.id,campaignId:d.campaignId||null,reason:d.reason,amount:take,cleared:cleared});
+    payment.deducted+=take;
+  });
+  payment.amount=gross-payment.deducted;
+  return payment.deducted;
+}
+
+// Every amount recovered from this member's contributions, newest first.
+function getMemberRecoveries(mid){
+  var out=[];
+  (DB.deductionPayments||[]).forEach(function(r){
+    if(r.memberId!==mid)return;
+    out.push({date:r.date,reason:r.reason||'Deduction',amount:r.amount,method:r.method,type:'Deduction'});
+  });
+  (DB.campaignPayments||[]).forEach(function(r){
+    if(r.memberId!==mid||!r.viaDeduction)return;
+    var c=DB.campaigns.find(function(x){return x.id===r.campaignId});
+    out.push({date:r.date,reason:c?c.title:'Other contribution',amount:r.amount,method:r.method,type:'Other Contribution'});
+  });
+  return out.sort(function(a,b){return String(b.date||'').localeCompare(String(a.date||''))});
+}
+function getMemberRecoveredTotal(mid){return getMemberRecoveries(mid).reduce(function(s,r){return s+r.amount},0)}
+// What the member actually handed over (contribution + anything deducted from it).
+function getMemberGrossPaid(mid){
+  return DB.payments.filter(function(p){return p.memberId===mid}).reduce(function(s,p){return s+(p.gross!==undefined?p.gross:p.amount)},0);
+}
+function paymentGross(p){return p.gross!==undefined?p.gross:p.amount}
+
+function canManageSessions(){return S.role==='Admin'||S.role==='Secretary'}
+function getActiveSession(){return DB.sessions.find(function(x){return x.status==='active'})}
+function sessionsList(){return DB.sessions.slice().sort(function(a,b){return b.id-a.id})}
+function nowTime(){var d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
+
+function openSession(){
+  if(!canManageSessions())return;
+  if(getActiveSession()){toast('A session is already open. Close it before starting a new one.');return}
+  DB.sessions.push({id:DB.nid.s++,date:getToday(),startedBy:S.user.name,startedAt:nowTime(),closedAt:'',closedBy:'',status:'active'});
+  save();toast('Collection session opened');render();
+}
+function closeSession(){
+  if(!canManageSessions())return;
+  var ses=getActiveSession();if(!ses)return;
+  var rows=sessionPaymentRows(ses.id);
+  var total=rows.reduce(function(s,r){return s+r.gross},0);
+  if(!confirm('Close this session? '+rows.length+' contribution(s) recorded, '+kes(total)+' collected in total.'))return;
+  ses.status='closed';ses.closedAt=nowTime();ses.closedBy=S.user.name;
+  save();toast('Session closed — '+rows.length+' contribution(s), '+kes(total)+' collected');render();
+}
+function viewSession(id){S.modal='sessionView';S.sessionFocusId=id;S.sessionRowFilter='all';render()}
+function switchSessionRowFilter(f){S.sessionRowFilter=f;render()}
+
+// One row per payment recorded during the session (not aggregated per member) so
+// a member paying towards two different months in one sitting shows as two lines.
+function sessionPaymentRows(sessionId){
+  return DB.payments.filter(function(p){return p.sessionId===sessionId}).map(function(p){
+    var m=DB.members.find(function(x){return x.id===p.memberId});
+    if(!m)return null;
+    return{m:m,p:p,gross:paymentGross(p),deducted:p.deducted||0,net:p.amount,month:p.month,date:p.date,method:p.method,items:p.deductionItems||[]};
+  }).filter(Boolean).sort(function(a,b){return a.m.name.localeCompare(b.m.name)||String(a.date).localeCompare(String(b.date))});
+}
+
+function renderSessionsPanel(){
+  var list=sessionsList();
+  var active=getActiveSession();
+  var bar='<div class="pnl" style="margin-bottom:14px"><div class="pnl-t"><h3>Collection Session</h3></div><div style="padding:14px">'+
+    (active?
+      '<p style="font-size:.78rem;margin-bottom:8px"><span class="pill pill-g">🟢 Open</span> &nbsp;Started by <b>'+esc(active.startedBy)+'</b> at '+active.startedAt+' on '+formatDateLong(active.date)+'</p>'+
+      (canManageSessions()?'<button class="btn btn-p" onclick="closeSession()" style="margin-right:6px">⏹ Close Session</button><button class="btn btn-s" onclick="viewSession('+active.id+')">🖨 View / Print So Far</button>':'<button class="btn btn-s" onclick="viewSession('+active.id+')">🖨 View / Print So Far</button>')+
+      '</div></div>'
+    :
+      '<p style="font-size:.78rem;color:var(--muted);margin-bottom:8px">No collection session is currently open.'+(canManageSessions()?' Open one before a meeting so every contribution recorded is grouped for printing afterwards.':'')+'</p>'+
+      (canManageSessions()?'<button class="btn btn-p" onclick="openSession()">▶ Open Session</button>':'')+
+      '</div></div>'
+    );
+  if(!list.length)return bar;
+  var closedList=list.filter(function(x){return x.status==='closed'});
+  if(!closedList.length)return bar;
+  return bar+'<div class="pnl"><div class="pnl-t"><h3>Past Sessions</h3></div><div class="g3" style="padding:14px">'+closedList.map(function(ses){
+    var rows=sessionPaymentRows(ses.id);
+    var total=rows.reduce(function(s,r){return s+r.gross},0);
+    var dedTotal=rows.reduce(function(s,r){return s+r.deducted},0);
+    var monthlyTotal=rows.reduce(function(s,r){return s+r.net},0);
+    return'<div class="report-card" onclick="viewSession('+ses.id+')"><h3>'+formatDateLong(ses.date)+'</h3><p>'+ses.startedAt+' – '+(ses.closedAt||'—')+'</p><p>'+rows.length+' contribution(s)</p><p style="font-weight:700;color:var(--navy)">'+kes(total)+' collected</p><p style="font-size:.68rem;color:var(--muted)">Monthly: '+kes(monthlyTotal)+(dedTotal>0?' &nbsp;|&nbsp; Deductions: '+kes(dedTotal):'')+'</p></div>';
+  }).join('')+'</div></div>';
+}
+
+function renderSessionModal(id){
+  var ses=DB.sessions.find(function(x){return x.id===id});
+  if(!ses)return'<div class="mbox"><p>Session not found</p></div>';
+  var allRows=sessionPaymentRows(id);
+  var filter=S.sessionRowFilter||'all';
+  var monthlyRows=allRows.filter(function(r){return r.net>0});
+  var deductionRows=allRows.filter(function(r){return r.deducted>0});
+  var rows=filter==='monthly'?monthlyRows:filter==='deduction'?deductionRows:allRows;
+  var total=allRows.reduce(function(s,r){return s+r.gross},0);
+  var dedTotal=allRows.reduce(function(s,r){return s+r.deducted},0);
+  var monthlyTotal=allRows.reduce(function(s,r){return s+r.net},0);
+  var cashTotal=allRows.filter(function(r){return r.method==='Cash'}).reduce(function(s,r){return s+r.gross},0);
+  var mpesaTotal=allRows.filter(function(r){return r.method==='M-Pesa'}).reduce(function(s,r){return s+r.gross},0);
+  var statsBar='<div class="g4" style="margin:10px 0 12px">'+
+    '<div class="sc"><label>Contributed Today</label><div class="v" style="color:var(--navy)">'+kes(total)+'</div></div>'+
+    '<div class="sc"><label>Monthly Contributions</label><div class="v" style="color:var(--green)">'+kes(monthlyTotal)+'</div></div>'+
+    '<div class="sc"><label>Deductions Cleared</label><div class="v" style="color:var(--amber)">'+kes(dedTotal)+'</div></div>'+
+    '<div class="sc"><label>Cash Collected</label><div class="v">'+kes(cashTotal)+'</div></div>'+
+    '<div class="sc"><label>M-Pesa Collected</label><div class="v">'+kes(mpesaTotal)+'</div></div>'+
+    '</div>';
+  var filterBar='<div class="mtab-row" style="margin-bottom:6px"><button class="mtab '+(filter==='all'?'on':'')+'" onclick="switchSessionRowFilter(\'all\')">All ('+allRows.length+')</button><button class="mtab '+(filter==='monthly'?'on':'')+'" onclick="switchSessionRowFilter(\'monthly\')">Monthly ('+monthlyRows.length+')</button><button class="mtab '+(filter==='deduction'?'on':'')+'" onclick="switchSessionRowFilter(\'deduction\')">Deduction ('+deductionRows.length+')</button></div>';
+  return'<div class="mbox" style="max-width:760px"><div class="mhd"><h3>Session — '+formatDateLong(ses.date)+' ('+ses.startedAt+(ses.status==='active'?', ongoing':' – '+ses.closedAt)+')</h3><div style="display:flex;gap:6px">'+(allRows.length?'<button class="btn btn-sm btn-s" onclick="downloadSessionA4('+ses.id+')">🖨 A4</button>':'')+'<button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div></div>'+
+  '<p style="font-size:.72rem;color:var(--muted);margin-bottom:0">Opened by '+esc(ses.startedBy)+(ses.status==='closed'?' &nbsp;·&nbsp; Closed by '+esc(ses.closedBy):' &nbsp;·&nbsp; <span class="pill pill-g">Still open</span>')+' &nbsp;|&nbsp; '+allRows.length+' contribution(s) recorded</p>'+
+  statsBar+filterBar+
+  '<div style="max-height:52vh;overflow:auto"><table><thead><tr><th>Member</th><th>Month Covered</th><th>Paid In</th><th>Deducted</th><th>To Contribution</th><th>Method</th></tr></thead><tbody>'+
+  (rows.length?rows.map(function(r){
+    var lines=[];
+    if(r.deducted>0){
+      r.items.forEach(function(it){lines.push('↪ '+kes(it.amount)+' cleared deduction — '+esc(it.reason))});
+    }
+    if(r.net>0){lines.push('↪ '+kes(r.net)+' covered '+esc(r.month))}
+    else if(r.deducted>0){lines.push('↪ '+esc(r.month)+' not yet covered — full payment went to the deduction above')}
+    var note=lines.length?'<div style="font-size:.66rem;color:var(--muted);margin-top:2px">'+lines.join('<br>')+'</div>':'';
+    return'<tr><td>'+esc(r.m.name)+note+'</td><td>'+esc(r.month)+'</td><td>'+kes(r.gross)+'</td><td style="color:'+(r.deducted>0?'var(--amber)':'var(--muted)')+'">'+(r.deducted>0?'-'+kes(r.deducted):'—')+'</td><td style="font-weight:700;color:var(--green)">'+kes(r.net)+'</td><td>'+esc(r.method)+'</td></tr>';
+  }).join(''):'<tr><td colspan="6" style="text-align:center;color:var(--muted)">No contributions match this filter.</td></tr>')+
+  '</tbody></table></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
+}
+
+// ─── ONE-PAGE A4 PRINTABLE: COLLECTION SESSION ───
+function downloadSessionA4(id){
+  var ses=DB.sessions.find(function(x){return x.id===id});if(!ses)return;
+  var rows=sessionPaymentRows(id);
+  if(!rows.length){toast('No contributions recorded in this session yet');return}
+  var n=rows.length;
+  var cols=n<=26?1:(n<=80?2:(n<=150?3:4));
+  var fs=n<=40?10:(n<=80?8.6:(n<=150?7.4:6.2));
+  var lh=n<=40?1.55:(n<=150?1.4:1.25);
+  var total=rows.reduce(function(s,r){return s+r.gross},0);
+  var dedTotal=rows.reduce(function(s,r){return s+r.deducted},0);
+  var netTotal=rows.reduce(function(s,r){return s+r.net},0);
+  var pad=String(n).length;
+  var list=rows.map(function(r,i){
+    var allocLine=r.deducted>0?'Paid '+kes(r.gross)+' for '+esc(r.month)+' — '+kes(r.deducted)+' deducted ('+r.items.map(function(it){return it.reason}).join('; ')+'), '+kes(r.net)+' to '+esc(r.month):'Full '+kes(r.net)+' to '+esc(r.month);
+    return'<div class="ln"><span class="idx">'+String(i+1).padStart(pad,'0')+'</span>'+
+      '<span class="nm">'+esc(r.m.name)+'</span>'+
+      '<span class="amt">'+kes(r.gross)+'</span>'+
+      '<span class="hw" style="color:'+(r.deducted>0?'#B45309':'#047857')+'">'+esc(r.method)+'</span>'+
+      '<div class="al">'+allocLine+'</div></div>';
+  }).join('');
+  var off=getOfficials();
+  var html='<html><head><title>Collection Session — '+formatDateLong(ses.date)+'</title><style>'+
+  '@page{size:A4 portrait;margin:8mm}'+
+  'body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:0;padding:0}'+
+  'h2{font-size:13px;margin:6px 0 2px;text-align:center;text-transform:uppercase;letter-spacing:.04em}'+
+  '.sub{font-size:9px;text-align:center;color:#444;margin-bottom:5px}'+
+  '.bar{display:flex;justify-content:center;gap:6px;flex-wrap:wrap;font-size:8px;margin-bottom:5px}'+
+  '.bar b{display:inline-block;border:1px solid #bbb;border-radius:3px;padding:2px 6px;font-weight:600;background:#fafafa}'+
+  '.grid{column-count:'+cols+';column-gap:8px;font-size:'+fs+'px;line-height:'+lh+'}'+
+  '.ln{break-inside:avoid;border-bottom:1px dotted #d8d8d8;padding:.5px 0}'+
+  '.ln>*:not(.al){display:inline-flex;align-items:baseline;gap:4px}'+
+  '.idx{color:#888;min-width:'+(pad*0.75+0.4)+'em}'+
+  '.nm{min-width:0}'+
+  '.amt{font-variant-numeric:tabular-nums;color:#333;margin-left:4px}'+
+  '.hw{font-weight:700;margin-left:4px}'+
+  '.al{font-size:.85em;color:#777;padding-left:'+(pad*0.75+0.4)+'em;display:block}'+
+  '.legend{font-size:7.5px;color:#555;margin-top:5px;text-align:center}'+
+  '.sig{display:flex;justify-content:space-between;margin-top:10px;font-size:8px}'+
+  '.sig div{width:31%;text-align:center}'+
+  '.sig .line{border-top:1px solid #333;margin-top:14px;padding-top:2px;color:#777;font-size:7px}'+
+  WATERMARK_CSS+'</style></head><body>'+
+  dlHeaderHTML()+
+  '<h2>Collection Session — '+formatDateLong(ses.date)+'</h2>'+
+  '<div class="sub">Opened by '+esc(ses.startedBy)+' at '+ses.startedAt+(ses.status==='closed'?' &middot; Closed by '+esc(ses.closedBy)+' at '+ses.closedAt:' &middot; Still open')+' &nbsp;·&nbsp; '+n+' contribution(s)</div>'+
+  '<div class="bar"><b>Paid in: '+kes(total)+'</b><b>Deducted for other balances: '+kes(dedTotal)+'</b><b>To contributions: '+kes(netTotal)+'</b></div>'+
+  '<div class="grid">'+list+'</div>'+
+  '<div class="legend">Each line shows what the member paid in during this session, which month it covered, and whether any of it was deducted first to clear an outstanding balance &nbsp;|&nbsp; Generated '+formatDateLong(getToday())+'</div>'+
+  '<div class="sig"><div>'+(esc(off.chairman)||'____________')+'<div class="line">Chairman</div></div><div>'+(esc(off.secretary)||'____________')+'<div class="line">Secretary</div></div><div>'+(esc(off.treasurer)||'____________')+'<div class="line">Treasurer</div></div></div>'+
+  '</body></html>';
+  openPrintableDoc(html,'Collection_Session_'+ses.date+'_'+getToday());
+}
 function getNextMemberNo(){
   var used={};
   DB.members.forEach(function(m){
@@ -708,7 +936,7 @@ function findDuplicatePaymentRef(ref,excludeId){
     return p.ref&&p.ref.trim().toLowerCase()===ref;
   })||null;
 }
-function totalCollected(){return DB.payments.reduce(function(s,p){return s+p.amount},0)+DB.campaignPayments.reduce(function(s,p){return s+p.amount},0)}
+function totalCollected(){return DB.payments.reduce(function(s,p){return s+p.amount},0)+DB.campaignPayments.reduce(function(s,p){return s+p.amount},0)+(DB.deductionPayments||[]).reduce(function(s,p){return s+p.amount},0)}
 function totalExpenses(){return DB.expenses.filter(function(e){return e.status==='Approved'}).reduce(function(s,e){return s+e.amount},0)}
 function totalOutstanding(){return activeMems().reduce(function(s,m){return s+getMemberTotalBalance(m.id)},0)}
 
@@ -937,6 +1165,7 @@ function render(){
   startCloudSyncIfNeeded();
   try{
     processCampaignDueDeductions();
+    reconcileCampaignDeductionPayments();
     app.innerHTML=renderShell()+(S.modal?renderModal():'')+(S.toast?'<div class="toast">'+esc(S.toast)+'</div>':'');
     if(S.page==='dashboard'&&(S.role==='Admin'||S.role==='Secretary'||S.role==='Officer'))initCharts();
   }catch(e){
@@ -945,8 +1174,38 @@ function render(){
   }
 }
 
+function reconcileCampaignDeductionPayments(){
+  // Money recorded as a "deduction payment" for a campaign-linked deduction (via the
+  // Deductions page "Record Payment" button, or an old data snapshot from before that
+  // button recorded it properly) should always be reflected in that campaign's own
+  // Paid/Balance figures too — otherwise the campaign shows a balance still owing
+  // while the deduction itself shows as settled. This keeps the two in sync.
+  var changed=false;
+  // Strip a stray "viaDeduction" flag left over from an earlier version of this file,
+  // which mistakenly tagged direct cash payments (made via the Deductions page) as if
+  // they'd been auto-recovered from a monthly contribution payment. A genuine
+  // auto-recovery always has a matching monthly payment record referencing it — if
+  // that link is missing, the flag was wrong and this was really a direct payment.
+  DB.campaignPayments.forEach(function(p){
+    if(!p.viaDeduction||!p.deductionId)return;
+    var matched=DB.payments.some(function(pay){
+      return pay.memberId===p.memberId&&(pay.deductionItems||[]).some(function(it){return it.deductionId===p.deductionId&&it.amount===p.amount});
+    });
+    if(!matched){delete p.viaDeduction;changed=true;}
+  });
+  DB.deductions.forEach(function(d){
+    if(d.source!=='campaign'||!d.campaignId)return;
+    var recorded=DB.campaignPayments.filter(function(p){return p.campaignId===d.campaignId&&p.memberId===d.memberId&&p.deductionId===d.id}).reduce(function(s,p){return s+p.amount},0);
+    var diff=d.paid-recorded;
+    if(diff>0){
+      DB.campaignPayments.push({id:DB.nid.cp++,campaignId:d.campaignId,memberId:d.memberId,amount:diff,date:d.date||getToday(),method:'Cash',deductionId:d.id});
+      changed=true;
+    }
+  });
+  if(changed)save();
+}
+
 function processCampaignDueDeductions(){
-  var today=getToday();
   var changed=false;
   // Drop any campaign-linked deductions that no longer match the member's eligibility
   // (e.g. after correcting a campaign's "Date Raised", or if it was added before that field existed).
@@ -956,8 +1215,13 @@ function processCampaignDueDeductions(){
     }
     return true;
   });
+  // Only a CLOSED campaign turns its unpaid balances into deductions — and only
+  // once per member (the "already" check below), never again after that. Closing
+  // is the one moment this happens automatically; nothing needs to be recorded
+  // by hand, and an Open campaign (even past its due date) is left alone until
+  // it's actually closed.
   DB.campaigns.forEach(function(c){
-    if(!c.dueDate||c.dueDate>today)return;
+    if(c.status!=='Closed')return;
     activeMems().forEach(function(m){
       if(!isMemberEligibleForCampaign(m.id,c.id))return;
       var already=DB.deductions.find(function(d){return d.source==='campaign'&&d.campaignId===c.id&&d.memberId===m.id});
@@ -965,7 +1229,7 @@ function processCampaignDueDeductions(){
       var paid=DB.campaignPayments.filter(function(p){return p.campaignId===c.id&&p.memberId===m.id}).reduce(function(s,p){return s+p.amount},0);
       var shortfall=c.amount-paid;
       if(shortfall>0){
-        DB.deductions.push({id:DB.nid.d++,memberId:m.id,reason:'Unpaid balance: '+c.title,amount:shortfall,paid:0,date:c.dueDate,status:'Outstanding',source:'campaign',campaignId:c.id});
+        DB.deductions.push({id:DB.nid.d++,memberId:m.id,reason:'Unpaid balance: '+c.title,amount:shortfall,paid:0,date:getToday(),status:'Outstanding',source:'campaign',campaignId:c.id});
         changed=true;
       }
     });
@@ -991,6 +1255,11 @@ function dlHeaderHTML(){
 
 // Logo watermark for every downloaded/printed document — repeats across
 // pages via fixed-position background image, sits behind content, doesn't affect layout.
+// Official group stamp/seal, overlaid on documents meant to be printed or handed
+// to someone outside the system (letters, official notices, statements). Only
+// appears once Admin → Settings has a stamp image uploaded.
+var STAMP_CSS='.official-stamp{position:fixed;right:34px;bottom:86px;width:104px;height:auto;opacity:.88;transform:rotate(-13deg);mix-blend-mode:multiply;pointer-events:none;z-index:2;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;color-adjust:exact!important}@media print{.official-stamp{position:fixed}}';
+function stampOverlayHTML(){return DB.settings.stamp?'<img class="official-stamp" src="'+DB.settings.stamp+'" alt="Official Stamp">':''}
 var WATERMARK_CSS='html,body{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;color-adjust:exact!important}body{position:relative}body::before{content:"";position:fixed;top:0;left:0;width:100%;height:100%;background-image:url('+IMG_WATERMARK+');background-repeat:no-repeat;background-position:center;background-size:45%;opacity:0.12;pointer-events:none;z-index:0;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;color-adjust:exact!important}body::after{content:"";position:fixed;top:0;left:0;width:100%;height:100%;background-image:url('+IMG_WATERMARK+');background-repeat:repeat;background-position:0 0;background-size:170px 170px;opacity:0.055;pointer-events:none;z-index:0;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;color-adjust:exact!important}@media print{body::before,body::after{position:fixed}}.content-above-watermark,table,h1,h2,h3,p,.sc,.mft,footer{position:relative;z-index:1}';
 
 // Self-contained version (inline styles) for use in downloaded/printed documents opened in a new window
@@ -1070,7 +1339,7 @@ function renderMembers(){
   var clearedCount=filtered.length-outstandingCount;
   if(S.balanceFilter==='outstanding')filtered=filtered.filter(function(m){return getMemberTotalBalance(m.id)>0});
   else if(S.balanceFilter==='cleared')filtered=filtered.filter(function(m){return getMemberTotalBalance(m.id)<=0});
-  return'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px"><h2 style="font-size:.94rem;font-weight:800">Members</h2><div style="display:flex;gap:6px">'+(S.role==='Admin'?'<button class="btn btn-s" onclick="exportMembersExcel()">⬇ Excel</button><button class="btn btn-s" onclick="downloadMembersPDF()">⬇ PDF</button><button class="btn btn-s" onclick="downloadAllMemberCardsPDF()">🪪 All Cards</button>':'')+'</div></div>'+
+  return'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px"><h2 style="font-size:.94rem;font-weight:800">Members</h2><div style="display:flex;gap:6px">'+(S.role==='Admin'?'<button class="btn btn-s" onclick="exportMembersExcel()">⬇ Excel</button><button class="btn btn-s" onclick="downloadMembersPDF()">⬇ PDF</button><button class="btn btn-s" onclick="S.modal=\'namesList\';render()">📋 Names List</button><button class="btn btn-s" onclick="downloadAllMemberCardsPDF()">🪪 All Cards</button>':'')+'</div></div>'+
   (S.role==='Admin'?'<p style="font-size:.7rem;color:var(--muted);margin-bottom:10px">Member details can only be added, edited or deleted from the <b>Administration</b> tab.</p>':'')+
   '<div class="mtab-row" style="margin-bottom:8px"><button class="mtab '+(!S.balanceFilter||S.balanceFilter==='all'?'on':'')+'" onclick="S.balanceFilter=\'all\';render()">All Balances</button><button class="mtab" style="'+(S.balanceFilter==='outstanding'?'':'opacity:.75')+';color:var(--red)" onclick="S.balanceFilter=\'outstanding\';render()">⚠ Outstanding ('+outstandingCount+')</button><button class="mtab" style="'+(S.balanceFilter==='cleared'?'':'opacity:.75')+';color:var(--green)" onclick="S.balanceFilter=\'cleared\';render()">✓ Cleared ('+clearedCount+')</button></div>'+
   '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap"><div class="mtab-row" style="margin-bottom:0"><button class="mtab '+(S.memberListTab==='active'?'on':'')+'" onclick="S.memberListTab=\'active\';render()">Active ('+active.length+')</button><button class="mtab '+(S.memberListTab==='inactive'?'on':'')+'" onclick="S.memberListTab=\'inactive\';render()">Inactive ('+inactive.length+')</button><button class="mtab '+(S.memberListTab==='all'?'on':'')+'" onclick="S.memberListTab=\'all\';render()">All ('+list.length+')</button></div>'+
@@ -1129,7 +1398,7 @@ function renderContributions(){
     '<button onclick="switchContribTab(\'monthly\')" style="flex:1;padding:10px 6px;border:none;background:none;font-weight:700;font-size:.8rem;cursor:pointer;color:'+(tab==='monthly'?'var(--navy)':'var(--muted)')+';border-bottom:3px solid '+(tab==='monthly'?'var(--navy)':'transparent')+'">Monthly Contributions</button>'+
     '<button onclick="switchContribTab(\'other\')" style="flex:1;padding:10px 6px;border:none;background:none;font-weight:700;font-size:.8rem;cursor:pointer;color:'+(tab==='other'?'var(--navy)':'var(--muted)')+';border-bottom:3px solid '+(tab==='other'?'var(--navy)':'transparent')+'">Other Contributions / Campaigns</button>'+
     '</div>';
-  var monthlySection='<div class="pnl"><div class="pnl-t"><h3>Monthly Contributions (KES '+DB.settings.monthlyAmount+'/month) — by Year</h3></div><div class="pnl-b"><p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">Select a year to open its months, or view every member\'s contributions across the whole year at once.</p><div class="g3">'+years.map(function(y){
+  var monthlySection=(tab==='monthly'&&canManageSessions()?'<p style="font-size:.7rem;color:var(--muted);margin-bottom:10px">Opening and closing collection sessions is now done from <b>Administration &rarr; Sessions</b>.</p>':'')+'<div class="pnl"><div class="pnl-t"><h3>Monthly Contributions (KES '+DB.settings.monthlyAmount+'/month) — by Year</h3></div><div class="pnl-b"><p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">Select a year to open its months, or view every member\'s contributions across the whole year at once.</p><div class="g3">'+years.map(function(y){
     var monthKeys=y.months.map(function(mo){return mo.key});
     var payments=DB.payments.filter(function(p){return monthKeys.indexOf(p.month)>-1});
     var payingIds={};payments.forEach(function(p){payingIds[p.memberId]=true});
@@ -1152,8 +1421,8 @@ function renderCampaignsSection(activeList){
       if(bal<=0||(dedRow&&dedRow.status==='Cleared'))paidCount++;
     });
     var unpaidCount=eligible.length-paidCount;
-    var isPastDue=c.dueDate&&c.dueDate<=getToday();
-    return'<tr style="cursor:pointer" onclick="viewCampaignDetail('+c.id+')"><td><b>'+esc(c.title)+'</b></td><td>'+kes(c.amount)+'</td><td>'+esc(c.beneficiary)+'</td><td>'+c.dueDate+'</td><td>'+paidCount+'/'+eligible.length+'</td><td style="color:'+(unpaidCount>0?'var(--red)':'var(--green)')+'">'+unpaidCount+(isPastDue&&unpaidCount>0?' (auto-deducted)':'')+'</td><td><span class="pill '+(c.status==='Closed'?'pill-g':'pill-a')+'">'+c.status+'</span></td><td onclick="event.stopPropagation()"><button class="btn btn-sm btn-s" onclick="viewCampaignDetail('+c.id+')">View</button> <button class="btn btn-sm btn-s" onclick="exportCampaignExcel('+c.id+')">⬇</button></td></tr>';
+    var isClosed=c.status==='Closed';
+    return'<tr style="cursor:pointer" onclick="viewCampaignDetail('+c.id+')"><td><b>'+esc(c.title)+'</b></td><td>'+kes(c.amount)+'</td><td>'+esc(c.beneficiary)+'</td><td>'+c.dueDate+'</td><td>'+paidCount+'/'+eligible.length+'</td><td style="color:'+(unpaidCount>0?'var(--red)':'var(--green)')+'">'+unpaidCount+(isClosed&&unpaidCount>0?' (auto-deducted)':'')+'</td><td><span class="pill '+(c.status==='Closed'?'pill-g':'pill-a')+'">'+c.status+'</span></td><td onclick="event.stopPropagation()"><button class="btn btn-sm btn-s" onclick="viewCampaignDetail('+c.id+')">View</button> <button class="btn btn-sm btn-s" onclick="exportCampaignExcel('+c.id+')" title="Download as Excel/CSV">⬇</button> <button class="btn btn-sm btn-s" onclick="downloadCampaignA4('+c.id+')" title="One-page A4 list of all members">🖨 A4</button></td></tr>';
   }).join('')+'</tbody></table></div>';
 }
 
@@ -1172,10 +1441,235 @@ function exportCampaignExcel(cid){
   downloadCSV(csv,(c.title.replace(/[^a-z0-9]+/gi,'_'))+'_participants_'+getToday()+'.csv');
 }
 
+// ─── ONE-PAGE A4 CAMPAIGN LIST ───
+// Every eligible member on a single A4 sheet, showing who paid directly, who was
+// cleared through a deduction from their monthly contribution, and who has not paid.
+function campaignMemberRows(cid){
+  var c=DB.campaigns.find(function(x){return x.id===cid});
+  if(!c)return[];
+  return activeMems().filter(function(m){return isMemberEligibleForCampaign(m.id,c.id)}).map(function(m){
+    var pays=DB.campaignPayments.filter(function(p){return p.campaignId===c.id&&p.memberId===m.id});
+    var paid=pays.reduce(function(s,p){return s+p.amount},0);
+    var viaDed=pays.filter(function(p){return p.viaDeduction}).reduce(function(s,p){return s+p.amount},0);
+    var direct=paid-viaDed;
+    var bal=c.amount-paid;
+    var dedRow=DB.deductions.find(function(d){return d.source==='campaign'&&d.campaignId===c.id&&d.memberId===m.id});
+    var how,mark;
+    if(bal<=0&&viaDed>0&&direct>0){how='Part deduction';mark='D+'}
+    else if(bal<=0&&viaDed>0){how='Through deduction';mark='D'}
+    else if(bal<=0){how='Paid directly';mark='\u2713'}
+    else if(paid>0){how='Part paid';mark='P'}
+    else if(dedRow&&dedRow.status==='Outstanding'){how='Pending deduction';mark='\u2022'}
+    else{how='Not paid';mark='\u2717'}
+    return{m:m,paid:paid,direct:direct,viaDeduction:viaDed,balance:bal,how:how,mark:mark,settled:bal<=0,dedRow:dedRow};
+  });
+}
+
+function downloadCampaignA4(cid){
+  var c=DB.campaigns.find(function(x){return x.id===cid});if(!c)return;
+  var rows=campaignMemberRows(cid);
+  if(!rows.length){toast('No eligible members for this contribution yet');return}
+  var n=rows.length;
+  // Squeeze the whole membership onto one sheet: more names, more columns, smaller type.
+  var cols=n<=26?1:(n<=80?2:(n<=150?3:4));
+  var fs=n<=40?10:(n<=80?8.6:(n<=150?7.4:6.2));
+  var lh=n<=40?1.55:(n<=150?1.4:1.25);
+  var paidDirect=rows.filter(function(r){return r.settled&&r.viaDeduction<=0}).length;
+  var viaDed=rows.filter(function(r){return r.settled&&r.viaDeduction>0}).length;
+  var partPaid=rows.filter(function(r){return !r.settled&&r.paid>0}).length;
+  var pending=rows.filter(function(r){return !r.settled&&r.paid<=0&&r.dedRow&&r.dedRow.status==='Outstanding'}).length;
+  var unpaid=rows.filter(function(r){return !r.settled&&r.paid<=0&&!(r.dedRow&&r.dedRow.status==='Outstanding')}).length;
+  var collected=rows.reduce(function(s,r){return s+r.paid},0);
+  var dedTotal=rows.reduce(function(s,r){return s+r.viaDeduction},0);
+  var pad=String(n).length;
+  var list=rows.map(function(r,i){
+    var col=r.settled?'#047857':(r.paid>0?'#B45309':'#B91C1C');
+    return'<div class="ln"><span class="idx">'+String(i+1).padStart(pad,'0')+'</span>'+
+      '<span class="nm">'+esc(r.m.name)+'</span>'+
+      '<span class="amt">'+kes(r.paid)+'</span>'+
+      '<span class="hw" style="color:'+col+'">'+r.mark+' '+r.how+'</span></div>';
+  }).join('');
+  var off=getOfficials();
+  var html='<html><head><title>'+esc(c.title)+' — Members List</title><style>'+
+  '@page{size:A4 portrait;margin:8mm}'+
+  'body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:0;padding:0}'+
+  'h2{font-size:13px;margin:6px 0 2px;text-align:center;text-transform:uppercase;letter-spacing:.04em}'+
+  '.sub{font-size:9px;text-align:center;color:#444;margin-bottom:5px}'+
+  '.bar{display:flex;justify-content:center;gap:6px;flex-wrap:wrap;font-size:8px;margin-bottom:5px}'+
+  '.bar b{display:inline-block;border:1px solid #bbb;border-radius:3px;padding:2px 6px;font-weight:600;background:#fafafa}'+
+  '.grid{column-count:'+cols+';column-gap:8px;font-size:'+fs+'px;line-height:'+lh+'}'+
+  '.ln{display:flex;gap:4px;align-items:baseline;break-inside:avoid;border-bottom:1px dotted #d8d8d8;padding:.5px 0}'+
+  '.idx{color:#888;min-width:'+(pad*0.75+0.4)+'em}'+
+  '.nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
+  '.amt{font-variant-numeric:tabular-nums;color:#333}'+
+  '.hw{min-width:8.4em;text-align:right;font-weight:700}'+
+  '.legend{font-size:7.5px;color:#555;margin-top:5px;text-align:center}'+
+  '.sig{display:flex;justify-content:space-between;margin-top:10px;font-size:8px}'+
+  '.sig div{width:31%;text-align:center}'+
+  '.sig .line{border-top:1px solid #333;margin-top:14px;padding-top:2px;color:#777;font-size:7px}'+
+  WATERMARK_CSS+'</style></head><body>'+
+  dlHeaderHTML()+
+  '<h2>'+esc(c.title)+' — Members List</h2>'+
+  '<div class="sub">'+kes(c.amount)+' per member &nbsp;·&nbsp; Beneficiary: '+esc(c.beneficiary||'—')+' &nbsp;·&nbsp; Due: '+(c.dueDate||'—')+' &nbsp;·&nbsp; Status: '+esc(c.status)+' &nbsp;·&nbsp; '+n+' eligible member(s)</div>'+
+  '<div class="bar"><b>Paid directly: '+paidDirect+'</b><b>Cleared through deduction: '+viaDed+'</b>'+(partPaid?'<b>Part paid: '+partPaid+'</b>':'')+(pending?'<b>Pending in deductions: '+pending+'</b>':'')+(unpaid?'<b>Not paid: '+unpaid+'</b>':'<b>Not paid: 0</b>')+'<b>Collected: '+kes(collected)+'</b><b>Of which deducted: '+kes(dedTotal)+'</b></div>'+
+  '<div class="grid">'+list+'</div>'+
+  '<div class="legend">&#10003; Paid directly (cash / M-Pesa / bank) &nbsp;·&nbsp; D Cleared through deduction from monthly contribution &nbsp;·&nbsp; D+ Part paid, rest deducted &nbsp;·&nbsp; P Part paid &nbsp;·&nbsp; &#8226; Pending in deductions &nbsp;·&nbsp; &#10007; Not paid &nbsp;&nbsp;|&nbsp;&nbsp; Generated '+formatDateLong(getToday())+'</div>'+
+  '<div class="sig"><div>'+(esc(off.chairman)||'____________')+'<div class="line">Chairman</div></div><div>'+(esc(off.secretary)||'____________')+'<div class="line">Secretary</div></div><div>'+(esc(off.treasurer)||'____________')+'<div class="line">Treasurer</div></div></div>'+
+  '</body></html>';
+  openPrintableDoc(html,c.title.replace(/[^a-z0-9]+/gi,'_')+'_members_list_'+getToday());
+}
+
 function campaignMemberStatusLabel(bal,dedRow){
-  if(bal<=0)return'Paid';
+  if(bal<=0)return dedRow&&dedRow.paid>0?'Cleared through deduction':'Paid';
   if(dedRow)return dedRow.status==='Cleared'?'Cleared via Deduction':'Pending in Deductions';
   return'Unpaid';
+}
+
+// ─── ONE-PAGE A4 PRINTABLE: MONTHLY CONTRIBUTIONS ───
+// Shows, per member, what they paid in, which month the payment record covers,
+// and where the money was allocated (straight to that month, or partly taken
+// out to clear an outstanding deduction first).
+function monthSessionRows(key){
+  var membersList=DB.members;
+  if(S.role==='HouseRep')membersList=membersList.filter(function(m){return m.house===S.user.house});
+  var activeList=membersList.filter(function(m){return m.status==='Active'});
+  var payments=DB.payments.filter(function(p){return p.month===key});
+  return activeList.map(function(m){
+    var mp=payments.filter(function(p){return p.memberId===m.id});
+    if(!mp.length)return null;
+    var gross=mp.reduce(function(s,p){return s+paymentGross(p)},0);
+    var deducted=mp.reduce(function(s,p){return s+(p.deducted||0)},0);
+    var net=mp.reduce(function(s,p){return s+p.amount},0);
+    var last=mp[mp.length-1];
+    var items=[];mp.forEach(function(p){(p.deductionItems||[]).forEach(function(it){items.push(it.reason)})});
+    return{m:m,gross:gross,deducted:deducted,net:net,date:last.date,method:last.method,items:items};
+  }).filter(Boolean).sort(function(a,b){return a.m.name.localeCompare(b.m.name)});
+}
+
+function downloadMonthSessionA4(key,label){
+  var rows=monthSessionRows(key);
+  if(!rows.length){toast('No contributions recorded for this month yet');return}
+  var n=rows.length;
+  var cols=n<=26?1:(n<=80?2:(n<=150?3:4));
+  var fs=n<=40?10:(n<=80?8.6:(n<=150?7.4:6.2));
+  var lh=n<=40?1.55:(n<=150?1.4:1.25);
+  var totalGross=rows.reduce(function(s,r){return s+r.gross},0);
+  var totalDed=rows.reduce(function(s,r){return s+r.deducted},0);
+  var totalNet=rows.reduce(function(s,r){return s+r.net},0);
+  var pad=String(n).length;
+  var list=rows.map(function(r,i){
+    var allocLine=r.deducted>0?'Paid '+kes(r.gross)+' — '+kes(r.deducted)+' deducted ('+r.items.join('; ')+'), '+kes(r.net)+' to '+esc(label):'Full '+kes(r.net)+' to '+esc(label);
+    return'<div class="ln"><span class="idx">'+String(i+1).padStart(pad,'0')+'</span>'+
+      '<span class="nm">'+esc(r.m.name)+'</span>'+
+      '<span class="amt">'+kes(r.gross)+'</span>'+
+      '<span class="hw" style="color:'+(r.deducted>0?'#B45309':'#047857')+'">'+(r.deducted>0?'Part deducted':'Full to month')+'</span>'+
+      '<div class="al">'+allocLine+'</div></div>';
+  }).join('');
+  var off=getOfficials();
+  var html='<html><head><title>Monthly Contributions — '+esc(label)+'</title><style>'+
+  '@page{size:A4 portrait;margin:8mm}'+
+  'body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:0;padding:0}'+
+  'h2{font-size:13px;margin:6px 0 2px;text-align:center;text-transform:uppercase;letter-spacing:.04em}'+
+  '.sub{font-size:9px;text-align:center;color:#444;margin-bottom:5px}'+
+  '.bar{display:flex;justify-content:center;gap:6px;flex-wrap:wrap;font-size:8px;margin-bottom:5px}'+
+  '.bar b{display:inline-block;border:1px solid #bbb;border-radius:3px;padding:2px 6px;font-weight:600;background:#fafafa}'+
+  '.grid{column-count:'+cols+';column-gap:8px;font-size:'+fs+'px;line-height:'+lh+'}'+
+  '.ln{break-inside:avoid;border-bottom:1px dotted #d8d8d8;padding:.5px 0}'+
+  '.ln>*:not(.al){display:inline-flex;align-items:baseline;gap:4px}'+
+  '.idx{color:#888;min-width:'+(pad*0.75+0.4)+'em}'+
+  '.nm{min-width:0}'+
+  '.amt{font-variant-numeric:tabular-nums;color:#333;margin-left:4px}'+
+  '.hw{font-weight:700;margin-left:4px}'+
+  '.al{font-size:.85em;color:#777;padding-left:'+(pad*0.75+0.4)+'em;display:block}'+
+  '.legend{font-size:7.5px;color:#555;margin-top:5px;text-align:center}'+
+  '.sig{display:flex;justify-content:space-between;margin-top:10px;font-size:8px}'+
+  '.sig div{width:31%;text-align:center}'+
+  '.sig .line{border-top:1px solid #333;margin-top:14px;padding-top:2px;color:#777;font-size:7px}'+
+  WATERMARK_CSS+'</style></head><body>'+
+  dlHeaderHTML()+
+  '<h2>Monthly Contributions — '+esc(label)+'</h2>'+
+  '<div class="sub">KES '+DB.settings.monthlyAmount+' per member &nbsp;·&nbsp; '+n+' member(s) contributed</div>'+
+  '<div class="bar"><b>Paid in: '+kes(totalGross)+'</b><b>Deducted for other balances: '+kes(totalDed)+'</b><b>To this month: '+kes(totalNet)+'</b></div>'+
+  '<div class="grid">'+list+'</div>'+
+  '<div class="legend">Each line shows the amount handed in, whether any of it was deducted to clear an outstanding balance first, and what actually went toward '+esc(label)+' &nbsp;|&nbsp; Generated '+formatDateLong(getToday())+'</div>'+
+  '<div class="sig"><div>'+(esc(off.chairman)||'____________')+'<div class="line">Chairman</div></div><div>'+(esc(off.secretary)||'____________')+'<div class="line">Secretary</div></div><div>'+(esc(off.treasurer)||'____________')+'<div class="line">Treasurer</div></div></div>'+
+  '</body></html>';
+  openPrintableDoc(html,'Monthly_Contributions_'+label.replace(/[^a-z0-9]+/gi,'_')+'_'+getToday());
+}
+
+// ─── ONE-PAGE A4 PRINTABLE: FULL-YEAR MONTHLY CONTRIBUTIONS ───
+function yearSessionRows(year){
+  var years=buildYearSessions();
+  var yearData=years.find(function(y){return y.year===year});
+  if(!yearData)return{rows:[],monthCount:0};
+  var membersList=DB.members;
+  if(S.role==='HouseRep')membersList=membersList.filter(function(m){return m.house===S.user.house});
+  var activeList=membersList.filter(function(m){return m.status==='Active'});
+  var monthKeys=yearData.months.map(function(mo){return mo.key});
+  var yearPayments=DB.payments.filter(function(p){return monthKeys.indexOf(p.month)>-1});
+  var rows=activeList.map(function(m){
+    var mp=yearPayments.filter(function(p){return p.memberId===m.id});
+    if(!mp.length)return null;
+    var gross=mp.reduce(function(s,p){return s+paymentGross(p)},0);
+    var deducted=mp.reduce(function(s,p){return s+(p.deducted||0)},0);
+    var net=mp.reduce(function(s,p){return s+p.amount},0);
+    var monthsCovered=[];mp.forEach(function(p){if(monthsCovered.indexOf(p.month)===-1)monthsCovered.push(p.month)});
+    return{m:m,gross:gross,deducted:deducted,net:net,months:monthsCovered};
+  }).filter(Boolean).sort(function(a,b){return a.m.name.localeCompare(b.m.name)});
+  return{rows:rows,monthCount:yearData.months.length};
+}
+
+function downloadYearSessionA4(year){
+  var data=yearSessionRows(year);
+  var rows=data.rows;
+  if(!rows.length){toast('No contributions recorded for '+year+' yet');return}
+  var n=rows.length;
+  var cols=n<=26?1:(n<=80?2:(n<=150?3:4));
+  var fs=n<=40?10:(n<=80?8.6:(n<=150?7.4:6.2));
+  var lh=n<=40?1.55:(n<=150?1.4:1.25);
+  var totalGross=rows.reduce(function(s,r){return s+r.gross},0);
+  var totalDed=rows.reduce(function(s,r){return s+r.deducted},0);
+  var totalNet=rows.reduce(function(s,r){return s+r.net},0);
+  var pad=String(n).length;
+  var list=rows.map(function(r,i){
+    var monthsTxt=r.months.length+' of '+data.monthCount+' month(s): '+r.months.join(', ');
+    var allocLine=r.deducted>0?monthsTxt+' — Paid '+kes(r.gross)+', '+kes(r.deducted)+' deducted, '+kes(r.net)+' to contributions':monthsTxt;
+    return'<div class="ln"><span class="idx">'+String(i+1).padStart(pad,'0')+'</span>'+
+      '<span class="nm">'+esc(r.m.name)+'</span>'+
+      '<span class="amt">'+kes(r.net)+'</span>'+
+      '<span class="hw" style="color:'+(r.deducted>0?'#B45309':'#047857')+'">'+(r.deducted>0?'Incl. deduction':'—')+'</span>'+
+      '<div class="al">'+allocLine+'</div></div>';
+  }).join('');
+  var off=getOfficials();
+  var html='<html><head><title>Monthly Contributions — '+year+'</title><style>'+
+  '@page{size:A4 portrait;margin:8mm}'+
+  'body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:0;padding:0}'+
+  'h2{font-size:13px;margin:6px 0 2px;text-align:center;text-transform:uppercase;letter-spacing:.04em}'+
+  '.sub{font-size:9px;text-align:center;color:#444;margin-bottom:5px}'+
+  '.bar{display:flex;justify-content:center;gap:6px;flex-wrap:wrap;font-size:8px;margin-bottom:5px}'+
+  '.bar b{display:inline-block;border:1px solid #bbb;border-radius:3px;padding:2px 6px;font-weight:600;background:#fafafa}'+
+  '.grid{column-count:'+cols+';column-gap:8px;font-size:'+fs+'px;line-height:'+lh+'}'+
+  '.ln{break-inside:avoid;border-bottom:1px dotted #d8d8d8;padding:.5px 0}'+
+  '.ln>*:not(.al){display:inline-flex;align-items:baseline;gap:4px}'+
+  '.idx{color:#888;min-width:'+(pad*0.75+0.4)+'em}'+
+  '.nm{min-width:0}'+
+  '.amt{font-variant-numeric:tabular-nums;color:#333;margin-left:4px}'+
+  '.hw{font-weight:700;margin-left:4px}'+
+  '.al{font-size:.85em;color:#777;padding-left:'+(pad*0.75+0.4)+'em;display:block}'+
+  '.legend{font-size:7.5px;color:#555;margin-top:5px;text-align:center}'+
+  '.sig{display:flex;justify-content:space-between;margin-top:10px;font-size:8px}'+
+  '.sig div{width:31%;text-align:center}'+
+  '.sig .line{border-top:1px solid #333;margin-top:14px;padding-top:2px;color:#777;font-size:7px}'+
+  WATERMARK_CSS+'</style></head><body>'+
+  dlHeaderHTML()+
+  '<h2>Monthly Contributions — '+year+' (Full Year)</h2>'+
+  '<div class="sub">KES '+DB.settings.monthlyAmount+' per member/month &nbsp;·&nbsp; '+n+' member(s) contributed</div>'+
+  '<div class="bar"><b>Paid in: '+kes(totalGross)+'</b><b>Deducted for other balances: '+kes(totalDed)+'</b><b>To contributions: '+kes(totalNet)+'</b></div>'+
+  '<div class="grid">'+list+'</div>'+
+  '<div class="legend">Each line shows the months a member\'s payments covered and, where relevant, how much was deducted to clear an outstanding balance first &nbsp;|&nbsp; Generated '+formatDateLong(getToday())+'</div>'+
+  '<div class="sig"><div>'+(esc(off.chairman)||'____________')+'<div class="line">Chairman</div></div><div>'+(esc(off.secretary)||'____________')+'<div class="line">Secretary</div></div><div>'+(esc(off.treasurer)||'____________')+'<div class="line">Treasurer</div></div></div>'+
+  '</body></html>';
+  openPrintableDoc(html,'Monthly_Contributions_'+year+'_'+getToday());
 }
 
 function renderMonthSessionModal(){
@@ -1193,7 +1687,7 @@ function renderMonthSessionModal(){
   }).filter(Boolean);
   var total=rows.reduce(function(s,r){return s+r.amt},0);
   var backBtn=S.yearSessionYear?'<button class="btn btn-sm btn-s" style="margin-bottom:10px" onclick="viewYearSession('+S.yearSessionYear+')">← Back to '+S.yearSessionYear+'</button>':'';
-  return'<div class="mbox" style="max-width:640px"><div class="mhd"><h3>Contributions — '+esc(label)+'</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div>'+
+  return'<div class="mbox" style="max-width:640px"><div class="mhd"><h3>Contributions — '+esc(label)+'</h3><div style="display:flex;gap:6px"><button class="btn btn-sm btn-s" onclick="downloadMonthSessionA4(\''+key+'\',\''+esc(label)+'\')">🖨 A4</button><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div></div>'+
   backBtn+
   '<p style="font-size:.76rem;color:var(--muted);margin-bottom:8px">'+rows.length+' member(s) contributed &nbsp;|&nbsp; Total collected: <b style="color:var(--navy)">'+kes(total)+'</b></p>'+
   '<div style="max-height:60vh;overflow:auto"><table><thead><tr><th>Member</th><th>No.</th><th>House</th><th>Amount</th><th>Date</th><th>Method</th></tr></thead><tbody>'+
@@ -1227,7 +1721,7 @@ function renderYearSessionModal(){
     }).filter(Boolean);
     rows.sort(function(a,b){return String(a.m.name).localeCompare(String(b.m.name))});
     var ftotal=rows.reduce(function(s,r){return s+r.amt},0);
-    return'<div class="mbox" style="max-width:680px"><div class="mhd"><h3>'+year+' — Full Year Contributions</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div>'+
+    return'<div class="mbox" style="max-width:680px"><div class="mhd"><h3>'+year+' — Full Year Contributions</h3><div style="display:flex;gap:6px"><button class="btn btn-sm btn-s" onclick="downloadYearSessionA4('+year+')">🖨 A4</button><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div></div>'+
     '<button class="btn btn-sm btn-s" style="margin-bottom:10px" onclick="S.yearFullView=false;render()">← Back to Months</button>'+
     '<p style="font-size:.76rem;color:var(--muted);margin-bottom:8px">'+rows.length+' member(s) contributed in '+year+' &nbsp;|&nbsp; Total collected: <b style="color:var(--navy)">'+kes(ftotal)+'</b></p>'+
     '<div style="max-height:60vh;overflow:auto"><table><thead><tr><th>Member</th><th>No.</th><th>House</th><th>Months Paid</th><th>Total Amount</th></tr></thead><tbody>'+
@@ -1235,7 +1729,7 @@ function renderYearSessionModal(){
     '</tbody></table></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
   }
 
-  return'<div class="mbox" style="max-width:680px"><div class="mhd"><h3>'+year+' — Select a Month</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div>'+
+  return'<div class="mbox" style="max-width:680px"><div class="mhd"><h3>'+year+' — Select a Month</h3><div style="display:flex;gap:6px"><button class="btn btn-sm btn-s" onclick="downloadYearSessionA4('+year+')">🖨 A4 (Full Year)</button><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div></div>'+
   '<p style="font-size:.76rem;color:var(--muted);margin-bottom:10px">Total collected in '+year+': <b style="color:var(--navy)">'+kes(total)+'</b></p>'+
   '<div class="g3" style="margin-bottom:14px">'+yearData.months.map(function(mo){
     var mp=DB.payments.filter(function(p){return p.month===mo.key});
@@ -1318,6 +1812,15 @@ function payDeductionPrompt(id){
   if(amt>bal)amt=bal;
   d.paid+=amt;
   if(d.paid>=d.amount)d.status='Cleared';
+  // If this deduction is a campaign shortfall, also record it as a campaign
+  // payment so the campaign's own Paid/Balance figures stay in sync — but
+  // WITHOUT the viaDeduction flag, since this is cash paid directly against
+  // the deduction, not money skimmed out of a monthly contribution. Marking
+  // it viaDeduction would wrongly show it as "recovered from a monthly
+  // contribution" in the Yearly Statement and campaign history.
+  if(d.source==='campaign'&&d.campaignId){
+    DB.campaignPayments.push({id:DB.nid.cp++,campaignId:d.campaignId,memberId:d.memberId,amount:amt,date:getToday(),method:'Cash',deductionId:d.id});
+  }
   save();toast('Deduction payment recorded');render();
 }
 
@@ -1361,7 +1864,8 @@ function renderExpenses(){
 function totalCashCollected(){
   var fromContrib=DB.payments.filter(function(p){return p.method==='Cash'}).reduce(function(s,p){return s+p.amount},0);
   var fromCampaigns=DB.campaignPayments.filter(function(p){return p.method==='Cash'}).reduce(function(s,p){return s+p.amount},0);
-  return fromContrib+fromCampaigns;
+  var fromDeductions=(DB.deductionPayments||[]).filter(function(p){return p.method==='Cash'}).reduce(function(s,p){return s+p.amount},0);
+  return fromContrib+fromCampaigns+fromDeductions;
 }
 // Anything paid by M-Pesa or Bank Transfer never passes through anyone's hand as
 // physical cash — it lands straight in the bank account. The system detects this
@@ -1370,7 +1874,8 @@ function totalCashCollected(){
 function totalNonCashCollected(){
   var fromContrib=DB.payments.filter(function(p){return p.method&&p.method!=='Cash'}).reduce(function(s,p){return s+p.amount},0);
   var fromCampaigns=DB.campaignPayments.filter(function(p){return p.method&&p.method!=='Cash'}).reduce(function(s,p){return s+p.amount},0);
-  return fromContrib+fromCampaigns;
+  var fromDeductions=(DB.deductionPayments||[]).filter(function(p){return p.method&&p.method!=='Cash'}).reduce(function(s,p){return s+p.amount},0);
+  return fromContrib+fromCampaigns+fromDeductions;
 }
 function totalCashDeposited(){return DB.bankDeposits.filter(function(d){return d.type!=='Withdrawal'}).reduce(function(s,d){return s+d.amount},0)}
 function totalCashWithdrawn(){return DB.bankDeposits.filter(function(d){return d.type==='Withdrawal'}).reduce(function(s,d){return s+d.amount},0)}
@@ -1609,7 +2114,10 @@ function computeYearlyAllocation(memberId,year){
   var totalDue=months.length*monthly;
   var totalPaidForYear=months.reduce(function(s,mm){return s+mm.paid},0);
   var yearPayments=DB.payments.filter(function(p){return p.memberId===memberId&&new Date(p.date).getFullYear()===year}).slice().sort(function(a,b){return new Date(a.date)-new Date(b.date)});
-  return{months:months,totalPaid:totalPaidForYear,totalDue:totalDue,balance:Math.max(0,totalDue-totalPaidForYear),payments:yearPayments,monthly:monthly};
+  var recoveries=getMemberRecoveries(memberId).filter(function(r){return new Date(r.date).getFullYear()===year});
+  var recovered=recoveries.reduce(function(s,r){return s+r.amount},0);
+  var grossForYear=yearPayments.reduce(function(s,p){return s+paymentGross(p)},0);
+  return{months:months,totalPaid:totalPaidForYear,totalDue:totalDue,balance:Math.max(0,totalDue-totalPaidForYear),payments:yearPayments,monthly:monthly,recoveries:recoveries,recovered:recovered,grossPaid:grossForYear};
 }
 
 function renderYearlyReportInline(){
@@ -1643,13 +2151,19 @@ function renderYearlyStatementTable(m,data,year){
   '<div class="sc"><label>Total Due ('+year+')</label><div class="v">'+kes(data.totalDue)+'</div></div>'+
   '<div class="sc"><label>Total Paid</label><div class="v">'+kes(data.totalPaid)+'</div></div>'+
   '<div class="sc"><label>Balance</label><div class="v" style="color:'+(data.balance>0?'var(--red)':'var(--green)')+'">'+kes(data.balance)+'</div></div>'+
+  (data.recovered>0?'<div class="sc"><label>Cleared Through Deduction</label><div class="v" style="color:var(--amber)">'+kes(data.recovered)+'</div></div>':'')+
   '</div>'+
   '<table style="margin-top:10px"><thead><tr><th>Month</th><th>Amount</th><th>Status</th></tr></thead><tbody>'+data.months.map(function(mo){
     return'<tr><td>'+mo.label+'</td><td>'+(mo.paid>0?kes(mo.paid):'—')+'</td><td><span class="pill '+(mo.status==='Paid'?'pill-g':mo.status==='Partial'?'pill-a':'pill-r')+'">'+mo.status+'</span></td></tr>';
   }).join('')+'</tbody></table></div>'+
-  '<div class="pnl" style="margin-top:12px"><div class="pnl-t"><h3>Payments Received in '+year+'</h3></div><table><thead><tr><th>Date</th><th>Amount</th><th>Method</th><th>Reference</th></tr></thead><tbody>'+(data.payments.length?data.payments.map(function(p){
-    return'<tr><td>'+formatDateLong(p.date)+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td><td>'+esc(p.ref||'—')+'</td></tr>';
-  }).join(''):'<tr><td colspan="4" style="text-align:center;color:var(--muted)">No payments recorded for '+year+'</td></tr>')+'</tbody></table></div></div>';
+  '<div class="pnl" style="margin-top:12px"><div class="pnl-t"><h3>Payments Received in '+year+'</h3></div><table><thead><tr><th>Date</th><th>Amount Paid In</th><th>Less: Deduction</th><th>To Monthly Contribution</th><th>Method</th><th>Reference</th></tr></thead><tbody>'+(data.payments.length?data.payments.map(function(p){
+    var ded=p.deducted||0;
+    var note=ded>0?'<div style="font-size:.66rem;color:var(--amber);margin-top:2px">'+(p.deductionItems||[]).map(function(it){return'↪ '+kes(it.amount)+' — '+esc(it.reason)+(it.cleared?' (cleared through deduction)':' (part payment through deduction)')}).join('<br>')+'</div>':'';
+    return'<tr><td>'+formatDateLong(p.date)+note+'</td><td>'+kes(paymentGross(p))+'</td><td style="color:'+(ded>0?'var(--amber)':'var(--muted)')+'">'+(ded>0?'-'+kes(ded):'—')+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td><td>'+esc(p.ref||'—')+'</td></tr>';
+  }).join(''):'<tr><td colspan="6" style="text-align:center;color:var(--muted)">No payments recorded for '+year+'</td></tr>')+'</tbody></table></div>'+
+  (data.recoveries.length?'<div class="pnl" style="margin-top:12px"><div class="pnl-t"><h3>Amounts Deducted From Contributions in '+year+'</h3></div><table><thead><tr><th>Date</th><th>What It Cleared</th><th>Type</th><th>Amount</th><th>Status</th></tr></thead><tbody>'+data.recoveries.map(function(r){
+    return'<tr><td>'+formatDateLong(r.date)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.type)+'</td><td>'+kes(r.amount)+'</td><td><span class="pill pill-g">Cleared through deduction</span></td></tr>';
+  }).join('')+'</tbody></table><p style="font-size:.68rem;color:var(--muted);padding:8px 14px 12px">These amounts were taken out of the monthly contributions above and used to settle what the member owed. They are not an extra charge — the money was already paid in.</p></div>':'')+'</div>';
 }
 
 function formatDateLong(dateStr){
@@ -1695,8 +2209,15 @@ function downloadYearlyStatementPDF(memberId,year){
   var m=DB.members.find(function(x){return x.id===memberId});if(!m)return;
   var data=computeYearlyAllocation(memberId,year);
   var rows=data.months.map(function(mo){return'<tr><td>'+mo.label+'</td><td>'+(mo.paid>0?kes(mo.paid):'—')+'</td><td>'+mo.status+'</td></tr>'}).join('');
-  var payRows=data.payments.length?data.payments.map(function(p){return'<tr><td>'+formatDateLong(p.date)+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td></tr>'}).join(''):'<tr><td colspan="3">No payments recorded</td></tr>';
-  var html='<html><head><title>'+esc(m.name)+' — '+year+' Statement</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse;margin:10px 0}th,td{padding:5px 8px;border:1px solid #ddd;text-align:left;font-size:11px}th{background:#f5f5f5}.sc{display:inline-block;border:1px solid #ddd;padding:8px 14px;margin:4px 8px 4px 0;border-radius:4px}.sc label{font-size:9px;color:#666;display:block}.sc .v{font-size:14px;font-weight:bold}'+PDF_PRINT_FOOTER_CSS+WATERMARK_CSS+'</style></head><body>'+dlHeaderHTML()+'<h3>Yearly Contribution Statement — '+year+'</h3><p>Member: <b>'+esc(m.name)+'</b> ('+m.no+') &nbsp; House: '+esc(m.house)+'</p><div class="sc"><label>Total Due</label><div class="v">'+kes(data.totalDue)+'</div></div><div class="sc"><label>Total Paid</label><div class="v">'+kes(data.totalPaid)+'</div></div><div class="sc"><label>Balance</label><div class="v">'+kes(data.balance)+'</div></div><h3>Monthly Breakdown</h3><table><thead><tr><th>Month</th><th>Amount</th><th>Status</th></tr></thead><tbody>'+rows+'</tbody></table><h3>Payments Received</h3><table><thead><tr><th>Date</th><th>Amount</th><th>Method</th></tr></thead><tbody>'+payRows+'</tbody></table><p style="color:#777;margin-top:16px">Generated: '+getToday()+'</p>'+blueprintFooterHTMLStandalone()+'</body></html>';
+  var payRows=data.payments.length?data.payments.map(function(p){
+    var ded=p.deducted||0;
+    var note=ded>0?'<div style="font-size:9px;color:#B45309">'+(p.deductionItems||[]).map(function(it){return'&#8618; '+kes(it.amount)+' — '+esc(it.reason)+(it.cleared?' (cleared through deduction)':' (part payment through deduction)')}).join('<br>')+'</div>':'';
+    return'<tr><td>'+formatDateLong(p.date)+note+'</td><td>'+kes(paymentGross(p))+'</td><td>'+(ded>0?'-'+kes(ded):'—')+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td></tr>';
+  }).join(''):'<tr><td colspan="5">No payments recorded</td></tr>';
+  var dedSection=data.recoveries.length?'<h3>Amounts Deducted From Contributions</h3><table><thead><tr><th>Date</th><th>What It Cleared</th><th>Type</th><th>Amount</th><th>Status</th></tr></thead><tbody>'+data.recoveries.map(function(r){
+    return'<tr><td>'+formatDateLong(r.date)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.type)+'</td><td>'+kes(r.amount)+'</td><td>Cleared through deduction</td></tr>';
+  }).join('')+'</tbody></table><p style="color:#777;font-size:10px">These amounts were taken out of the monthly contributions listed above and used to settle what the member owed — not an extra charge.</p>':'';
+  var html='<html><head><title>'+esc(m.name)+' — '+year+' Statement</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse;margin:10px 0}th,td{padding:5px 8px;border:1px solid #ddd;text-align:left;font-size:11px}th{background:#f5f5f5}.sc{display:inline-block;border:1px solid #ddd;padding:8px 14px;margin:4px 8px 4px 0;border-radius:4px}.sc label{font-size:9px;color:#666;display:block}.sc .v{font-size:14px;font-weight:bold}'+PDF_PRINT_FOOTER_CSS+WATERMARK_CSS+'</style></head><body>'+dlHeaderHTML()+'<h3>Yearly Contribution Statement — '+year+'</h3><p>Member: <b>'+esc(m.name)+'</b> ('+m.no+') &nbsp; House: '+esc(m.house)+'</p><div class="sc"><label>Total Due</label><div class="v">'+kes(data.totalDue)+'</div></div><div class="sc"><label>Total Paid</label><div class="v">'+kes(data.totalPaid)+'</div></div><div class="sc"><label>Balance</label><div class="v">'+kes(data.balance)+'</div></div>'+(data.recovered>0?'<div class="sc"><label>Cleared Through Deduction</label><div class="v">'+kes(data.recovered)+'</div></div>':'')+'<h3>Monthly Breakdown</h3><table><thead><tr><th>Month</th><th>Amount</th><th>Status</th></tr></thead><tbody>'+rows+'</tbody></table><h3>Payments Received</h3><table><thead><tr><th>Date</th><th>Amount Paid In</th><th>Less: Deduction</th><th>To Monthly Contribution</th><th>Method</th></tr></thead><tbody>'+payRows+'</tbody></table>'+dedSection+'<p style="color:#777;margin-top:16px">Generated: '+getToday()+'</p>'+blueprintFooterHTMLStandalone()+'</body></html>';
   openPrintableDoc(html,esc(m.name)+'_'+year+'_statement');
 }
 
@@ -1720,14 +2241,18 @@ function computeLedgerData(startYear,startIdx){
     });
     var totalPaidPeriod=monthData.reduce(function(s,d){return s+d.amt},0);
     var expectedPeriod=months.length*DB.settings.monthlyAmount;
+    var overallBalance=getMemberBalance(m.id),deductionBal=getMemberDeductionBal(m.id);
     return{
       member:m,
       monthData:monthData,
       totalPaidPeriod:totalPaidPeriod,
       expectedPeriod:expectedPeriod,
       periodBalance:Math.max(0,expectedPeriod-totalPaidPeriod),
-      overallBalance:getMemberBalance(m.id),
-      deductionBal:getMemberDeductionBal(m.id),
+      overallBalance:overallBalance,
+      deductionBal:deductionBal,
+      // Deduction Balance is recovered automatically out of the member's next monthly
+      // contribution, so for display purposes the two are just one owed amount.
+      totalBalance:overallBalance+deductionBal,
       advanceCredit:getMemberAdvanceCredit(m.id)
     };
   });
@@ -1736,6 +2261,7 @@ function computeLedgerData(startYear,startIdx){
     totalCollected:rows.reduce(function(s,r){return s+r.totalPaidPeriod},0),
     totalOutstanding:rows.reduce(function(s,r){return s+r.overallBalance},0),
     totalDeductions:rows.reduce(function(s,r){return s+r.deductionBal},0),
+    totalBalance:rows.reduce(function(s,r){return s+r.totalBalance},0),
     totalAdvance:rows.reduce(function(s,r){return s+r.advanceCredit},0),
     totalMembers:DB.members.length
   };
@@ -1805,7 +2331,7 @@ function renderLedgerReportInline(){
 }
 function renderLedgerTable(data){
   var months=data.months;
-  var head='<tr><th>No.</th><th>Name</th><th>Deduction Bal.</th><th>Monthly Balance</th>'+months.map(function(mo){return'<th>'+mo.label+'</th>'}).join('')+'<th>Total Paid</th><th>Advance</th></tr>';
+  var head='<tr><th>No.</th><th>Name</th><th>Balance</th>'+months.map(function(mo){return'<th>'+mo.label+'</th>'}).join('')+'<th>Total Paid</th><th>Advance</th></tr>';
   var body=data.rows.map(function(r,idx){
     var mCells=r.monthData.map(function(d){
       var over=d.amt>DB.settings.monthlyAmount;
@@ -1813,17 +2339,17 @@ function renderLedgerTable(data){
       return'<td'+(over?' style="background:#ecfdf5"':'')+'>'+amtHtml+'</td>';
     }).join('');
     var advCell=r.advanceCredit>0?'<span class="pill pill-g" style="white-space:nowrap">▲ '+kes(r.advanceCredit)+'</span>':'—';
-    return'<tr><td>'+(idx+1)+'</td><td>'+esc(r.member.name)+'</td><td style="color:var(--amber)">'+kes(r.deductionBal)+'</td><td style="color:var(--red)">'+kes(r.overallBalance)+'</td>'+mCells+'<td>'+kes(r.totalPaidPeriod)+'</td><td>'+advCell+'</td></tr>';
+    return'<tr><td>'+(idx+1)+'</td><td>'+esc(r.member.name)+'</td><td style="color:var(--red)">'+kes(r.totalBalance)+'</td>'+mCells+'<td>'+kes(r.totalPaidPeriod)+'</td><td>'+advCell+'</td></tr>';
   }).join('');
-  var totalsRow='<tr style="font-weight:800;background:#FAFAF8"><td colspan="2">Totals ('+data.totals.totalMembers+' members)</td><td>'+kes(data.totals.totalDeductions)+'</td><td>'+kes(data.totals.totalOutstanding)+'</td>'+data.totals.perMonthCollected.map(function(v){return'<td>'+kes(v)+'</td>'}).join('')+'<td>'+kes(data.totals.totalCollected)+'</td><td>'+kes(data.totals.totalAdvance)+'</td></tr>';
-  return'<div class="pnl" id="report-content"><p style="font-size:.68rem;color:var(--muted);margin:4px 0 8px">▲ green = member paid <b>more</b> than the required monthly amount that month. The Advance column shows any amount paid ahead of schedule, beyond all months due up to today.</p><table><thead>'+head+'</thead><tbody>'+body+totalsRow+'</tbody></table></div>';
+  var totalsRow='<tr style="font-weight:800;background:#FAFAF8"><td colspan="2">Totals ('+data.totals.totalMembers+' members)</td><td>'+kes(data.totals.totalBalance)+'</td>'+data.totals.perMonthCollected.map(function(v){return'<td>'+kes(v)+'</td>'}).join('')+'<td>'+kes(data.totals.totalCollected)+'</td><td>'+kes(data.totals.totalAdvance)+'</td></tr>';
+  return'<div class="pnl" id="report-content"><p style="font-size:.68rem;color:var(--muted);margin:4px 0 8px">Balance combines monthly contribution and deduction balances — a deduction balance is settled automatically out of the member\'s next monthly contribution, so nothing needs to be tracked separately. ▲ green = member paid <b>more</b> than the required monthly amount that month. The Advance column shows any amount paid ahead of schedule, beyond all months due up to today.</p><table><thead>'+head+'</thead><tbody>'+body+totalsRow+'</tbody></table></div>';
 }
 function downloadLedgerPDF(startYear,startIdx){
   var data=computeLedgerData(startYear,startIdx);
   var months=data.months;
   var off=getOfficials();
   var periodLabel=months[0].full+' – '+months[3].full;
-  var head='<tr><th rowspan="2">No.</th><th rowspan="2">Name</th><th rowspan="2">Deduction<br>Balance</th><th rowspan="2">Monthly<br>Balance</th>'+months.map(function(mo){return'<th colspan="2">'+mo.label+'</th>'}).join('')+'<th rowspan="2">Total<br>Paid</th><th rowspan="2">Deduction<br>Paid</th><th rowspan="2">Advance</th></tr><tr>'+months.map(function(){return'<th>Amount</th><th>Paid Via</th>'}).join('')+'</tr>';
+  var head='<tr><th rowspan="2">No.</th><th rowspan="2">Name</th><th rowspan="2">Balance</th>'+months.map(function(mo){return'<th colspan="2">'+mo.label+'</th>'}).join('')+'<th rowspan="2">Total<br>Paid</th><th rowspan="2">Deduction<br>Paid</th><th rowspan="2">Advance</th></tr><tr>'+months.map(function(){return'<th>Amount</th><th>Paid Via</th>'}).join('')+'</tr>';
   var body=data.rows.map(function(r,idx){
     var mCells=r.monthData.map(function(d){
       var over=d.amt>DB.settings.monthlyAmount;
@@ -1832,9 +2358,9 @@ function downloadLedgerPDF(startYear,startIdx){
       return amtCell+viaCell;
     }).join('');
     var advCell=r.advanceCredit>0?kes(r.advanceCredit)+' \u25B2':'—';
-    return'<tr><td>'+(idx+1)+'</td><td style="white-space:nowrap">'+esc(r.member.name)+'</td><td>'+kes(r.deductionBal)+'</td><td>'+kes(r.overallBalance)+'</td>'+mCells+'<td>—</td><td>________</td><td>'+advCell+'</td></tr>';
+    return'<tr><td>'+(idx+1)+'</td><td style="white-space:nowrap">'+esc(r.member.name)+'</td><td>'+kes(r.totalBalance)+'</td>'+mCells+'<td>—</td><td>________</td><td>'+advCell+'</td></tr>';
   }).join('');
-  var totalsRow='<tr style="font-weight:bold;background:#f5f5f5"><td colspan="2">TOTALS ('+data.totals.totalMembers+' members)</td><td>'+kes(data.totals.totalDeductions)+'</td><td>'+kes(data.totals.totalOutstanding)+'</td>'+data.totals.perMonthCollected.map(function(v){return'<td colspan="2">'+kes(v)+'</td>'}).join('')+'<td>—</td><td>—</td><td>'+kes(data.totals.totalAdvance)+'</td></tr>';
+  var totalsRow='<tr style="font-weight:bold;background:#f5f5f5"><td colspan="2">TOTALS ('+data.totals.totalMembers+' members)</td><td>'+kes(data.totals.totalBalance)+'</td>'+data.totals.perMonthCollected.map(function(v){return'<td colspan="2">'+kes(v)+'</td>'}).join('')+'<td>—</td><td>—</td><td>'+kes(data.totals.totalAdvance)+'</td></tr>';
   // This report intentionally does NOT use the shared fixed-position
   // header/footer (unlike other exports): with 13+ narrow columns across
   // 4 months, a header/footer pinned to every page risks colliding with
@@ -1900,23 +2426,36 @@ function renderReportDetail(){
 }
 
 function renderMonthlyReport(){
-  return'<div class="pnl" id="report-content"><div class="pnl-t"><h3>Monthly Contribution Report</h3></div><table><thead><tr><th>Member</th><th>Month</th><th>Amount</th><th>Date</th><th>Method</th></tr></thead><tbody>'+DB.payments.slice().sort(function(a,b){return b.date.localeCompare(a.date)}).map(function(p){var m=DB.members.find(function(x){return x.id===p.memberId});return'<tr><td>'+esc(m?m.name:'')+'</td><td>'+esc(p.month)+'</td><td>'+kes(p.amount)+'</td><td>'+p.date+'</td><td>'+esc(p.method)+'</td></tr>'}).join('')+'</tbody></table></div>';
+  return'<div class="pnl" id="report-content"><div class="pnl-t"><h3>Monthly Contribution Report</h3></div><p style="font-size:.7rem;color:var(--muted);padding:0 14px 8px">Amount is what was actually paid in. Where part of it was used to clear an outstanding deduction, the split is shown; \'To Month\' is what counted toward that month\'s contribution.</p><table><thead><tr><th>Member</th><th>Month</th><th>Amount Paid In</th><th>Deducted</th><th>To Month</th><th>Date</th><th>Method</th></tr></thead><tbody>'+DB.payments.slice().sort(function(a,b){return b.date.localeCompare(a.date)}).map(function(p){
+    var m=DB.members.find(function(x){return x.id===p.memberId});
+    var ded=p.deducted||0;
+    return'<tr><td>'+esc(m?m.name:'')+'</td><td>'+esc(p.month)+'</td><td>'+kes(paymentGross(p))+'</td><td>'+(ded>0?kes(ded):'—')+'</td><td>'+kes(p.amount)+'</td><td>'+p.date+'</td><td>'+esc(p.method)+'</td></tr>';
+  }).join('')+'</tbody></table></div>';
 }
 function renderDefaultersReport(){
-  var defaulters=activeMems().filter(function(m){return getMemberBalance(m.id)>0});
-  return'<div class="pnl" id="report-content"><div class="pnl-t"><h3>Defaulters Report</h3></div><table><thead><tr><th>No.</th><th>Name</th><th>House</th><th>Outstanding Months</th><th>Amount</th></tr></thead><tbody>'+defaulters.map(function(m){var unpaid=getMemberUnpaidMonths(m.id);return'<tr><td>'+esc(m.no)+'</td><td>'+esc(m.name)+'</td><td>'+esc(m.house)+'</td><td>'+unpaid.join(', ')+'</td><td style="color:var(--red);font-weight:700">'+kes(getMemberBalance(m.id))+'</td></tr>'}).join('')+'</tbody></table></div>';
+  var defaulters=activeMems().filter(function(m){return getMemberTotalBalance(m.id)>0});
+  return'<div class="pnl" id="report-content"><div class="pnl-t"><h3>Defaulters Report</h3></div><p style="font-size:.7rem;color:var(--muted);padding:0 14px 8px">Balance combines monthly contribution and deduction balances — a deduction balance is settled automatically out of a member\'s next monthly contribution, so it doesn\'t need to be paid separately unless they\'d rather clear it directly.</p><table><thead><tr><th>No.</th><th>Name</th><th>House</th><th>Outstanding Months</th><th>Balance</th></tr></thead><tbody>'+defaulters.map(function(m){
+    var unpaid=getMemberUnpaidMonths(m.id);
+    var total=getMemberTotalBalance(m.id);
+    return'<tr><td>'+esc(m.no)+'</td><td>'+esc(m.name)+'</td><td>'+esc(m.house)+'</td><td>'+(unpaid.length?unpaid.join(', '):'—')+'</td><td style="color:var(--red);font-weight:700">'+kes(total)+'</td></tr>';
+  }).join('')+'</tbody></table></div>';
 }
 function renderIncomeReport(){
   var tc=totalCollected(),te=totalExpenses();
   return'<div id="report-content"><div class="g3" style="margin-bottom:14px"><div class="sc"><label>Total Income</label><div class="v" style="color:var(--green)">'+kes(tc)+'</div></div><div class="sc"><label>Total Expenses</label><div class="v" style="color:var(--red)">'+kes(te)+'</div></div><div class="sc"><label>Net</label><div class="v">'+kes(tc-te)+'</div></div></div></div>';
 }
 function renderStatementReport(){
-  return'<div class="pnl" id="report-content"><div class="pnl-t"><h3>Member Statements</h3></div><table><thead><tr><th>No.</th><th>Name</th><th>House</th><th>Total Paid</th><th>Outstanding</th></tr></thead><tbody>'+sortByName(DB.members).map(function(m){var paid=DB.payments.filter(function(p){return p.memberId===m.id}).reduce(function(s,p){return s+p.amount},0);return'<tr><td>'+esc(m.no)+'</td><td>'+esc(m.name)+'</td><td>'+esc(m.house)+'</td><td>'+kes(paid)+'</td><td style="color:var(--red)">'+kes(getMemberTotalBalance(m.id))+'</td></tr>'}).join('')+'</tbody></table></div>';
+  return'<div class="pnl" id="report-content"><div class="pnl-t"><h3>Member Statements</h3></div><table><thead><tr><th>No.</th><th>Name</th><th>House</th><th>Paid In</th><th>Deducted</th><th>To Contributions</th><th>Outstanding</th></tr></thead><tbody>'+sortByName(DB.members).map(function(m){
+    var gross=getMemberGrossPaid(m.id);
+    var deducted=getMemberRecoveredTotal(m.id);
+    var net=DB.payments.filter(function(p){return p.memberId===m.id}).reduce(function(s,p){return s+p.amount},0);
+    return'<tr><td>'+esc(m.no)+'</td><td>'+esc(m.name)+'</td><td>'+esc(m.house)+'</td><td>'+kes(gross)+'</td><td style="color:'+(deducted>0?'var(--amber)':'var(--muted)')+'">'+(deducted>0?kes(deducted):'—')+'</td><td>'+kes(net)+'</td><td style="color:var(--red)">'+kes(getMemberTotalBalance(m.id))+'</td></tr>';
+  }).join('')+'</tbody></table></div>';
 }
 function renderCampaignsReport(){
   return'<div id="report-content">'+DB.campaigns.map(function(c){
     var eligible=activeMems().filter(function(m){return isMemberEligibleForCampaign(m.id,c.id)});
-    return'<div class="pnl"><div class="pnl-t"><h3>'+esc(c.title)+' ('+kes(c.amount)+'/member)</h3><div style="display:flex;align-items:center;gap:8px"><span class="pill '+(c.status==='Closed'?'pill-g':'pill-a')+'">'+c.status+'</span><button class="btn btn-sm btn-s no-print" onclick="exportCampaignExcel('+c.id+')">⬇ Download</button></div></div><table><thead><tr><th>Member</th><th>Required</th><th>Paid</th><th>Balance</th><th>Status</th><th class="no-print"></th></tr></thead><tbody>'+eligible.map(function(m){
+    return'<div class="pnl"><div class="pnl-t"><h3>'+esc(c.title)+' ('+kes(c.amount)+'/member)</h3><div style="display:flex;align-items:center;gap:8px"><span class="pill '+(c.status==='Closed'?'pill-g':'pill-a')+'">'+c.status+'</span><button class="btn btn-sm btn-s no-print" onclick="exportCampaignExcel('+c.id+')">⬇ Excel</button><button class="btn btn-sm btn-s no-print" onclick="downloadCampaignA4('+c.id+')">🖨 A4 List</button></div></div><table><thead><tr><th>Member</th><th>Required</th><th>Paid</th><th>Balance</th><th>Status</th><th class="no-print"></th></tr></thead><tbody>'+eligible.map(function(m){
       var paid=DB.campaignPayments.filter(function(p){return p.campaignId===c.id&&p.memberId===m.id}).reduce(function(s,p){return s+p.amount},0);
       var bal=c.amount-paid;
       var dedRow=DB.deductions.find(function(d){return d.source==='campaign'&&d.campaignId===c.id&&d.memberId===m.id});
@@ -2067,13 +2606,35 @@ function downloadLetter(id){
   var l=DB.documents.letters.find(function(x){return x.id===id});
   if(!l)return;
   var bodyHtml=esc(l.body).replace(/\n/g,'<br>');
-  var html='<html><head><title>'+esc(DB.settings.groupName)+' - '+esc(l.title)+'</title><style>body{font-family:sans-serif;padding:20px;font-size:13px;line-height:1.7}'+PDF_PRINT_FOOTER_CSS+WATERMARK_CSS+'</style></head><body>'+letterheadHTML()+
+  var html='<html><head><title>'+esc(DB.settings.groupName)+' - '+esc(l.title)+'</title><style>body{font-family:sans-serif;padding:20px;font-size:13px;line-height:1.7}'+PDF_PRINT_FOOTER_CSS+WATERMARK_CSS+STAMP_CSS+'</style></head><body>'+letterheadHTML()+
   '<p style="text-align:right;margin-top:18px">'+formatDateLong(l.date)+'</p>'+
   (l.recipient?'<p style="margin-top:10px">'+esc(l.recipient)+'</p>':'')+
   '<h3 style="margin-top:18px">Re: '+esc(l.title)+'</h3>'+
   '<div style="margin-top:10px">'+bodyHtml+'</div>'+
+  stampOverlayHTML()+
   blueprintFooterHTMLStandalone()+'</body></html>';
   openPrintableDoc(html,'letter_'+l.title.replace(/[^a-z0-9]+/gi,'_')+'_'+l.date);
+}
+
+// ─── NOTICE AS A PRINTABLE / DOWNLOADABLE LETTER ───
+// Turns the currently posted notice into a formal letter (letterhead, date,
+// "To: All Members", the notice text, official stamp if configured, and
+// signature lines) — for when it needs to be printed and pinned up, or handed
+// to someone who isn't using the system.
+function downloadNoticeLetter(){
+  var n=DB.notice;
+  if(!n){toast('No notice to print — post one first');return}
+  var bodyHtml=esc(n.text).replace(/\n/g,'<br>');
+  var html='<html><head><title>'+esc(DB.settings.groupName)+' - Notice</title><style>body{font-family:sans-serif;padding:20px;font-size:13px;line-height:1.7}'+PDF_PRINT_FOOTER_CSS+WATERMARK_CSS+STAMP_CSS+'</style></head><body>'+letterheadHTML()+
+  '<p style="text-align:right;margin-top:18px">'+formatDateLong(n.postedAt.slice(0,10))+'</p>'+
+  '<p style="margin-top:10px">To: All Members</p>'+
+  '<h3 style="margin-top:18px">Re: Notice</h3>'+
+  '<div style="margin-top:10px">'+bodyHtml+'</div>'+
+  '<p style="margin-top:18px;font-size:11px;color:#777">Posted by '+esc(n.postedBy)+' on '+formatDT(n.postedAt)+'</p>'+
+  stampOverlayHTML()+
+  signatureBlockHTML()+
+  blueprintFooterHTMLStandalone()+'</body></html>';
+  openPrintableDoc(html,'notice_'+getToday());
 }
 
 function renderMyStatement(){
@@ -2089,29 +2650,36 @@ function renderMyStatement(){
   var ledger=getMemberLedgerThrough(mid,c.year,c.monthIndex);
   var unpaid=ledger.months.filter(function(mm){return mm.status!=='Paid'});
   var bal=getMemberTotalBalance(mid);
+  var recoveries=getMemberRecoveries(mid);
+  var recovered=recoveries.reduce(function(s,r){return s+r.amount},0);
   var campDebts=[];
   DB.campaigns.forEach(function(c){
     if(isMemberEligibleForCampaign(mid,c.id)){
-      var paid=DB.campaignPayments.filter(function(p){return p.campaignId===c.id&&p.memberId===mid}).reduce(function(s,p){return s+p.amount},0);
-      campDebts.push({id:c.id,title:c.title,amount:c.amount,paid:paid,balance:c.amount-paid,status:c.status});
+      var cps=DB.campaignPayments.filter(function(p){return p.campaignId===c.id&&p.memberId===mid});
+      var paid=cps.reduce(function(s,p){return s+p.amount},0);
+      var viaDed=cps.filter(function(p){return p.viaDeduction}).reduce(function(s,p){return s+p.amount},0);
+      campDebts.push({id:c.id,title:c.title,amount:c.amount,paid:paid,balance:c.amount-paid,status:c.status,viaDeduction:viaDed});
     }
   });
   return tabRow+'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:4px"><h2 style="font-size:.94rem;font-weight:800">My Statement</h2><button class="btn btn-sm btn-s" onclick="S.modal=\'idCard\';S.viewMemberId='+mid+';render()">🪪 View My ID Card</button></div><p style="font-size:.72rem;color:var(--muted);margin-bottom:14px">'+esc(m.name)+' | '+esc(m.no)+' | '+esc(m.house)+'</p>'+
-  '<div class="g4" style="margin-bottom:14px"><div class="sc"><label>Total Paid</label><div class="v" style="color:var(--green)">'+kes(payments.reduce(function(s,p){return s+p.amount},0))+'</div></div><div class="sc"><label>Outstanding</label><div class="v" style="color:var(--red)">'+kes(bal)+'</div></div><div class="sc"><label>Unpaid Months</label><div class="v">'+unpaid.length+'</div></div><div class="sc"><label>Member Since</label><div class="v" style="font-size:.86rem">'+m.joined+'</div></div></div>'+
+  '<div class="g4" style="margin-bottom:14px"><div class="sc"><label>Total Paid In</label><div class="v" style="color:var(--green)">'+kes(getMemberGrossPaid(mid))+'</div></div><div class="sc"><label>Outstanding</label><div class="v" style="color:var(--red)">'+kes(bal)+'</div></div><div class="sc"><label>Unpaid Months</label><div class="v">'+unpaid.length+'</div></div>'+(recovered>0?'<div class="sc"><label>Cleared Through Deduction</label><div class="v" style="color:var(--amber)">'+kes(recovered)+'</div></div>':'<div class="sc"><label>Member Since</label><div class="v" style="font-size:.86rem">'+m.joined+'</div></div>')+'</div>'+
   (ledger.advanceCredit>0?'<div class="pnl" style="background:#ecfdf5;border:1px solid #1a8a4a;margin-bottom:14px"><p style="font-size:.78rem;margin:0"><b style="color:var(--green)">▲ Advance credit: '+kes(ledger.advanceCredit)+'</b> — all months up to date are fully paid, and this amount has been paid ahead of time. It will automatically cover next month\'s contribution once it becomes due.</p></div>':'')+
   '<div class="pnl"><div class="pnl-t"><h3>Monthly Contributions</h3><button class="btn btn-sm btn-s" onclick="downloadPDF()">⬇ PDF</button></div><table><thead><tr><th>Month</th><th>Amount Due</th><th>Amount Allocated</th><th>Status</th></tr></thead><tbody>'+ledger.months.slice().reverse().map(function(mo){
     return'<tr><td>'+mo.label+'</td><td>'+kes(DB.settings.monthlyAmount)+'</td><td>'+(mo.paid>0?kes(mo.paid):'—')+'</td><td><span class="pill '+(mo.status==='Paid'?'pill-g':mo.status==='Partial'?'pill-a':'pill-r')+'">'+mo.status+'</span></td></tr>';
   }).join('')+'</tbody></table></div>'+
   (campDebts.length?'<div class="pnl"><div class="pnl-t"><h3>Other Contributions</h3><button class="btn btn-sm btn-s" onclick="exportMemberCampaignsExcel('+mid+')">⬇ Download All</button></div><table><thead><tr><th>Campaign</th><th>Required</th><th>Paid</th><th>Balance</th><th>Campaign Status</th><th>My Status</th><th></th></tr></thead><tbody>'+campDebts.map(function(cd){
-    return'<tr><td>'+esc(cd.title)+'</td><td>'+kes(cd.amount)+'</td><td>'+kes(cd.paid)+'</td><td style="color:'+(cd.balance>0?'var(--red)':'var(--green)')+'">'+kes(cd.balance)+'</td><td><span class="pill '+(cd.status==='Closed'?'pill-g':'pill-a')+'">'+cd.status+'</span></td><td><span class="pill '+(cd.balance<=0?'pill-g':'pill-r')+'">'+(cd.balance<=0?'Paid':'Unpaid')+'</span></td><td><button class="btn btn-sm btn-s" onclick="exportSingleCampaignMemberExcel('+cd.id+','+mid+')">⬇ This one</button></td></tr>';
-  }).join('')+'</tbody></table></div>':'');
+    return'<tr><td>'+esc(cd.title)+'</td><td>'+kes(cd.amount)+'</td><td>'+kes(cd.paid)+'</td><td style="color:'+(cd.balance>0?'var(--red)':'var(--green)')+'">'+kes(cd.balance)+'</td><td><span class="pill '+(cd.status==='Closed'?'pill-g':'pill-a')+'">'+cd.status+'</span></td><td><span class="pill '+(cd.balance<=0?'pill-g':'pill-r')+'">'+(cd.balance<=0?(cd.viaDeduction>0?'Cleared through deduction':'Paid'):'Unpaid')+'</span></td><td><button class="btn btn-sm btn-s" onclick="exportSingleCampaignMemberExcel('+cd.id+','+mid+')">⬇ This one</button></td></tr>';
+  }).join('')+'</tbody></table></div>':'')+
+  (recoveries.length?'<div class="pnl"><div class="pnl-t"><h3>Amounts Deducted From My Contributions</h3></div><table><thead><tr><th>Date</th><th>What It Cleared</th><th>Type</th><th>Amount</th><th>Status</th></tr></thead><tbody>'+recoveries.map(function(r){
+    return'<tr><td>'+formatDateLong(r.date)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.type)+'</td><td>'+kes(r.amount)+'</td><td><span class="pill pill-g">Cleared through deduction</span></td></tr>';
+  }).join('')+'</tbody></table><p style="font-size:.68rem;color:var(--muted);padding:8px 14px 12px">These amounts were taken out of monthly contributions already paid in and used to settle what was owed — they are not an extra charge.</p></div>':'');
 }
 
 function renderAdmin(){
   if(S.role!=='Admin'&&S.role!=='Secretary')return'<div class="empty">Admin access required.</div>';
   return'<h2 style="font-size:.94rem;font-weight:800;margin-bottom:12px">Administration</h2>'+
-  '<div class="mtab-row"><button class="mtab '+(S.adminTab==='members'?'on':'')+'" onclick="S.adminTab=\'members\';render()">Members</button><button class="mtab '+(S.adminTab==='contributions'?'on':'')+'" onclick="S.adminTab=\'contributions\';render()">Contributions</button><button class="mtab '+(S.adminTab==='deductions'?'on':'')+'" onclick="S.adminTab=\'deductions\';render()">Deductions</button><button class="mtab '+(S.adminTab==='expenses'?'on':'')+'" onclick="S.adminTab=\'expenses\';render()">Expenses</button><button class="mtab '+(S.adminTab==='deposits'?'on':'')+'" onclick="S.adminTab=\'deposits\';render()">Deposits</button><button class="mtab '+(S.adminTab==='assets'?'on':'')+'" onclick="S.adminTab=\'assets\';render()">Assets</button><button class="mtab '+(S.adminTab==='houses'?'on':'')+'" onclick="S.adminTab=\'houses\';render()">Houses</button><button class="mtab '+(S.adminTab==='positions'?'on':'')+'" onclick="S.adminTab=\'positions\';render()">Positions</button><button class="mtab '+(S.adminTab==='approvals'?'on':'')+'" onclick="S.adminTab=\'approvals\';render()">Approvals</button><button class="mtab '+(S.adminTab==='documents'?'on':'')+'" onclick="S.adminTab=\'documents\';render()">Documents</button><button class="mtab '+(S.adminTab==='notice'?'on':'')+'" onclick="S.adminTab=\'notice\';render()">Notice</button><button class="mtab '+(S.adminTab==='sms'?'on':'')+'" onclick="S.adminTab=\'sms\';render()">SMS</button><button class="mtab '+(S.adminTab==='users'?'on':'')+'" onclick="S.adminTab=\'users\';render()">Users</button><button class="mtab '+(S.adminTab==='settings'?'on':'')+'" onclick="S.adminTab=\'settings\';render()">Settings</button></div>'+
-  (S.adminTab==='members'?renderAdminMembers():S.adminTab==='contributions'?renderAdminContributions():S.adminTab==='deductions'?renderAdminDeductions():S.adminTab==='expenses'?renderAdminExpenses():S.adminTab==='deposits'?renderAdminDeposits():S.adminTab==='assets'?renderAssetsSummary(true):S.adminTab==='houses'?renderAdminHouses():S.adminTab==='positions'?renderAdminPositions():S.adminTab==='approvals'?renderAdminApprovals():S.adminTab==='documents'?renderDocuments(true):S.adminTab==='notice'?renderAdminNotice():S.adminTab==='sms'?renderSMS():S.adminTab==='users'?renderAdminUsers():renderAdminSettings());
+  '<div class="mtab-row"><button class="mtab '+(S.adminTab==='members'?'on':'')+'" onclick="S.adminTab=\'members\';render()">Members</button><button class="mtab '+(S.adminTab==='sessions'?'on':'')+'" onclick="S.adminTab=\'sessions\';render()">Sessions</button><button class="mtab '+(S.adminTab==='contributions'?'on':'')+'" onclick="S.adminTab=\'contributions\';render()">Contributions</button><button class="mtab '+(S.adminTab==='deductions'?'on':'')+'" onclick="S.adminTab=\'deductions\';render()">Deductions</button><button class="mtab '+(S.adminTab==='expenses'?'on':'')+'" onclick="S.adminTab=\'expenses\';render()">Expenses</button><button class="mtab '+(S.adminTab==='deposits'?'on':'')+'" onclick="S.adminTab=\'deposits\';render()">Deposits</button><button class="mtab '+(S.adminTab==='assets'?'on':'')+'" onclick="S.adminTab=\'assets\';render()">Assets</button><button class="mtab '+(S.adminTab==='houses'?'on':'')+'" onclick="S.adminTab=\'houses\';render()">Houses</button><button class="mtab '+(S.adminTab==='positions'?'on':'')+'" onclick="S.adminTab=\'positions\';render()">Positions</button><button class="mtab '+(S.adminTab==='approvals'?'on':'')+'" onclick="S.adminTab=\'approvals\';render()">Approvals</button><button class="mtab '+(S.adminTab==='documents'?'on':'')+'" onclick="S.adminTab=\'documents\';render()">Documents</button><button class="mtab '+(S.adminTab==='notice'?'on':'')+'" onclick="S.adminTab=\'notice\';render()">Notice</button><button class="mtab '+(S.adminTab==='sms'?'on':'')+'" onclick="S.adminTab=\'sms\';render()">SMS</button><button class="mtab '+(S.adminTab==='users'?'on':'')+'" onclick="S.adminTab=\'users\';render()">Users</button><button class="mtab '+(S.adminTab==='settings'?'on':'')+'" onclick="S.adminTab=\'settings\';render()">Settings</button></div>'+
+  (S.adminTab==='members'?renderAdminMembers():S.adminTab==='sessions'?renderSessionsPanel():S.adminTab==='contributions'?renderAdminContributions():S.adminTab==='deductions'?renderAdminDeductions():S.adminTab==='expenses'?renderAdminExpenses():S.adminTab==='deposits'?renderAdminDeposits():S.adminTab==='assets'?renderAssetsSummary(true):S.adminTab==='houses'?renderAdminHouses():S.adminTab==='positions'?renderAdminPositions():S.adminTab==='approvals'?renderAdminApprovals():S.adminTab==='documents'?renderDocuments(true):S.adminTab==='notice'?renderAdminNotice():S.adminTab==='sms'?renderSMS():S.adminTab==='users'?renderAdminUsers():renderAdminSettings());
 }
 
 function renderAdminDeductions(){
@@ -2171,7 +2739,7 @@ function renderAdminNotice(){
   '<p style="font-size:.74rem;color:var(--muted);margin-bottom:12px">Post a message that every member sees in a banner as soon as they log in (or while they\'re using the system). It disappears automatically once it expires — after that you can post a new one.</p>'+
   (active?
     '<div class="warn-box" style="background:var(--sky);border-color:var(--border);color:var(--navy)">Currently live: <b>"'+esc(n.text)+'"</b><br><span style="font-size:.68rem;color:var(--muted)">Posted by '+esc(n.postedBy)+' on '+formatDT(n.postedAt)+' · disappears '+formatDT(n.expiresAt)+'</span></div>'+
-    '<button class="btn btn-sm btn-d" onclick="clearNotice()">Clear Notice Now</button>'+
+    '<button class="btn btn-sm btn-s" onclick="downloadNoticeLetter()">🖨 Print / Download as Letter</button> <button class="btn btn-sm btn-d" onclick="clearNotice()">Clear Notice Now</button>'+
     '<p style="font-size:.7rem;color:var(--muted);margin-top:10px">A new notice can be posted once this one is cleared or expires.</p>'
   :
     '<div class="field"><label>Notice Message</label><textarea id="noticeText" rows="3" style="width:100%;border:1px solid var(--border);border-radius:8px;padding:10px;font-size:.8rem;font-family:inherit" placeholder="e.g. Meeting this Saturday 10am at the hall"></textarea></div>'+
@@ -2191,7 +2759,7 @@ function renderAdminMembers(){
   return'<div class="pnl"><div class="pnl-t"><h3>Bulk Member Registration</h3></div><div style="padding:14px"><p style="font-size:.74rem;color:var(--muted);margin-bottom:10px">Register multiple members at once directly in the system — no file to download or fill offline. Add a row per member and, optionally, record a contribution they\'ve already paid at the same time. Up to <b>'+MAX_BULK_ROWS+' members</b> per batch. Members with an age of '+MAX_AGE+'+ or matching an existing name/ID will be skipped automatically.</p><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><button class="btn btn-p" onclick="openBulkRegisterModal()">+ Open Bulk Registration Form</button><button class="btn btn-s" onclick="openBulkPasteModal()">📋 Paste from Excel</button><label class="btn btn-s" style="margin:0">⬆ Upload Excel/CSV File<input type="file" accept=".csv,.xlsx,.xls" onchange="handleBulkUpload(event)" style="display:none"></label><button class="btn btn-s" onclick="downloadMemberTemplate()">⬇ Excel Template</button></div><p style="font-size:.68rem;color:var(--muted);margin-top:8px">Upload accepts .xlsx, .xls or .csv files matching the template column order — every row is recorded exactly as uploaded (skipped rows, if any, are listed after upload with the reason).</p></div></div>'+
   '<div class="pnl"><div class="pnl-t" style="flex-wrap:wrap;gap:8px"><h3>Manage Members (Add / Edit / Delete)</h3><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">'+
   (selCount?'<span style="font-size:.7rem;color:var(--muted);font-weight:700">'+selCount+' selected</span><button class="btn btn-sm btn-s" onclick="openBulkEditMembersModal()">✎ Bulk Edit</button><button class="btn btn-sm btn-d" onclick="bulkDeleteMembers()">🗑 Delete Selected</button>':'')+
-  '<button class="btn btn-sm btn-s" onclick="exportMembersExcel()">⬇ Excel</button><button class="btn btn-sm btn-s" onclick="downloadMembersPDF()">⬇ PDF</button><button class="btn btn-sm btn-s" onclick="scanMemberByNumber()">🔍 Scan ID Card</button><button class="btn btn-sm btn-s" onclick="downloadAllMemberCardsPDF()">🪪 Download All Cards</button><button class="btn btn-sm btn-s" onclick="renumberAllMembersToNMSHG()">🔢 Renumber to NMSHG-M format</button><button class="btn btn-sm btn-p" onclick="S.modal=\'addMember\';render()">+ Add</button></div></div><table><thead><tr><th><input type="checkbox" onclick="toggleAllMemberSel(['+ids.join(',')+'])" '+(allChecked?'checked':'')+'></th><th>No.</th><th>Name</th><th>ID No.</th><th>Phone</th><th>House</th><th>DOB</th><th>Age</th><th>Eligibility</th><th>Joined</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+list.map(function(m){
+  '<button class="btn btn-sm btn-s" onclick="exportMembersExcel()">⬇ Excel</button><button class="btn btn-sm btn-s" onclick="downloadMembersPDF()">⬇ PDF</button><button class="btn btn-sm btn-s" onclick="S.modal=\'namesList\';render()">📋 Names List</button><button class="btn btn-sm btn-s" onclick="scanMemberByNumber()">🔍 Scan ID Card</button><button class="btn btn-sm btn-s" onclick="downloadAllMemberCardsPDF()">🪪 Download All Cards</button><button class="btn btn-sm btn-s" onclick="renumberAllMembersToNMSHG()">🔢 Renumber to NMSHG-M format</button><button class="btn btn-sm btn-p" onclick="S.modal=\'addMember\';render()">+ Add</button></div></div><table><thead><tr><th><input type="checkbox" onclick="toggleAllMemberSel(['+ids.join(',')+'])" '+(allChecked?'checked':'')+'></th><th>No.</th><th>Name</th><th>ID No.</th><th>Phone</th><th>House</th><th>DOB</th><th>Age</th><th>Eligibility</th><th>Joined</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+list.map(function(m){
     var age=getAge(m.dob),eligible=age<MAX_AGE,checked=!!(S.bulkMemberSel&&S.bulkMemberSel[m.id]);
     return'<tr><td><input type="checkbox" onclick="toggleMemberSel('+m.id+')" '+(checked?'checked':'')+'></td><td>'+esc(m.no)+'</td><td><b>'+esc(m.name)+'</b></td><td>'+esc(m.idNo)+'</td><td>'+esc(m.phone)+'</td><td>'+esc(m.house)+'</td><td>'+esc(m.dob)+'</td><td'+(age>=MAX_AGE?' style="color:var(--red);font-weight:700"':'')+'>'+age+'</td><td><span class="pill '+(eligible?'pill-g':'pill-r')+'">'+(eligible?'Eligible':'Over limit')+'</span></td><td>'+m.joined+'</td><td><span class="pill '+(m.status==='Active'?'pill-g':'pill-r')+'">'+m.status+'</span></td><td><button class="btn btn-sm btn-s" onclick="S.modal=\'editMember\';S.editMemberId='+m.id+';render()">Edit</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'idCard\';S.viewMemberId='+m.id+';render()">🪪 Card</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'dependents\';S.viewMemberId='+m.id+';render()">👨‍👩‍👧 Dependents</button> <button class="btn btn-sm btn-d" onclick="deleteMember('+m.id+')">Delete</button></td></tr>';
   }).join('')+'</tbody></table></div>';
@@ -2845,8 +3413,12 @@ function renderAdminSettings(){
   return'<div class="g2"><div class="pnl"><div class="pnl-t"><h3>Group Details</h3></div><div style="padding:14px"><div class="field"><label>Group Name</label><input id="setGroupName" value="'+esc(DB.settings.groupName)+'"></div><div class="field"><label>Group Phone Number</label><input id="setGroupPhone" type="tel" placeholder="e.g. 0712 345678" value="'+esc(DB.settings.groupPhone||'')+'"></div><div class="field"><label>Group Email</label><input id="setGroupEmail" type="email" placeholder="e.g. newmatheri@gmail.com" value="'+esc(DB.settings.groupEmail||'')+'"></div>'+
   '<div class="field"><label>Group Logo</label>'+(DB.settings.logo?'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px"><img src="'+DB.settings.logo+'" alt="Group logo" style="width:70px;height:70px;object-fit:contain;border:1px solid var(--border);border-radius:8px;background:#fff"><button type="button" class="btn btn-sm btn-d" onclick="removeGroupLogo()">Remove Logo</button></div>':'<p style="font-size:.68rem;color:var(--muted);margin:0 0 8px">No logo uploaded yet.</p>')+
   '<input type="file" id="setGroupLogo" accept="image/*" style="display:none" onchange="uploadGroupLogo(this)"><button type="button" class="btn btn-s" onclick="document.getElementById(\'setGroupLogo\').click()">⬆ '+(DB.settings.logo?'Change Logo':'Upload Logo')+'</button></div>'+
+  '<div class="field"><label>Official Stamp / Seal</label>'+(DB.settings.stamp?'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px"><img src="'+DB.settings.stamp+'" alt="Group stamp" style="width:70px;height:70px;object-fit:contain;border:1px solid var(--border);border-radius:8px;background:#fff"><button type="button" class="btn btn-sm btn-d" onclick="removeGroupStamp()">Remove Stamp</button></div>':'<p style="font-size:.68rem;color:var(--muted);margin:0 0 8px">No stamp uploaded yet. Use a scan or photo of the group\'s official stamp on a plain background — a transparent PNG works best.</p>')+
+  '<input type="file" id="setGroupStamp" accept="image/*" style="display:none" onchange="uploadGroupStamp(this)"><button type="button" class="btn btn-s" onclick="document.getElementById(\'setGroupStamp\').click()">⬆ '+(DB.settings.stamp?'Change Stamp':'Upload Stamp')+'</button><p style="font-size:.68rem;color:var(--muted);margin-top:6px">Once uploaded, it\'s automatically added to Letters and printed Notices — documents meant to be handed or sent to someone outside the system.</p></div>'+
   '<button class="btn btn-p" onclick="saveGroupDetails()">Save</button><p style="font-size:.68rem;color:var(--muted);margin-top:6px">The group email appears on the letterhead of documents written in Documents → Letters.</p></div></div>'+
-  '<div class="pnl"><div class="pnl-t"><h3>Monthly Contribution</h3></div><div style="padding:14px"><div class="field"><label>Amount (KES)</label><input id="setAmt" type="number" value="'+DB.settings.monthlyAmount+'"></div><button class="btn btn-p" onclick="DB.settings.monthlyAmount=parseInt(document.getElementById(\'setAmt\').value)||100;save();toast(\'Updated\');render()">Update</button></div></div>'+
+  '<div class="pnl"><div class="pnl-t"><h3>Monthly Contribution</h3></div><div style="padding:14px"><div class="field"><label>Amount (KES)</label><input id="setAmt" type="number" value="'+DB.settings.monthlyAmount+'"></div><button class="btn btn-p" onclick="DB.settings.monthlyAmount=parseInt(document.getElementById(\'setAmt\').value)||100;save();toast(\'Updated\');render()">Update</button>'+
+  '<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)"><label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer"><input type="checkbox" id="setAutoDed" '+(autoDeductEnabled()?'checked':'')+' onchange="toggleAutoDeduct(this.checked)" style="margin-top:2px"><span><b style="font-size:.76rem">Recover outstanding amounts from monthly contributions</b><br><span style="font-size:.68rem;color:var(--muted)">When a member owes an unpaid share of an other contribution (or any other deduction), that amount is taken out of the next monthly contribution they pay — oldest debt first — and their statement shows it as <i>Cleared through deduction</i>. Switch this off to go back to requiring deductions to be cleared separately before a monthly contribution can be recorded.</span></span></label></div>'+
+  '</div></div>'+
   '<div class="pnl"><div class="pnl-t"><h3>Default Login Passwords</h3></div><div style="padding:14px"><div class="field"><label>Shared Default Password (for ALL Members)</label><input id="setSharedPwd" value="'+esc(DB.settings.sharedMemberPassword||'matheri@001')+'"></div><div class="field"><label>Shared Default Password (for ALL House Reps)</label><input id="setSharedRepPwd" value="'+esc(DB.settings.sharedHouseRepPassword||'matheri@002')+'"></div><button class="btn btn-p" onclick="savePasswordPrefix()">Save</button>'+
   '<p style="font-size:.68rem;color:var(--muted);margin-top:8px">Every member without a Custom Login Password logs in with their own <b>National ID Number</b> as username and the Members password for all '+DB.members.length+' members (e.g. '+esc((DB.settings.sharedMemberPassword||'matheri@001').toLowerCase())+'). House Reps log in with <b>House Name(their National ID Number)</b> as username (e.g. Block A(23456781)) and the House Reps password above — the same for every House Rep, in every house.</p>'+
   '<p style="font-size:.68rem;color:var(--muted);margin-top:6px">Changing either password updates everyone in that group at once — no need to tell each person individually unless they\'ve been given a Custom Login Password (Members tab → Edit), which always overrides the shared default. Use Administration → Users, or the "Change Password" button while logged in, to set/reset passwords per person over time.</p></div></div>'+
@@ -2891,6 +3463,11 @@ function uploadLocalToCloud(){
   });
 }
 
+function toggleAutoDeduct(on){
+  DB.settings.autoDeduct=!!on;
+  save();toast(on?'Deductions will now be recovered from monthly contributions':'Auto-deduction switched off');render();
+}
+
 function saveGroupDetails(){
   var name=document.getElementById('setGroupName').value.trim();
   var phone=document.getElementById('setGroupPhone').value.trim();
@@ -2932,6 +3509,25 @@ function removeGroupLogo(){
   if(!confirm('Remove the group logo?'))return;
   DB.settings.logo='';
   save();toast('Logo removed');render();
+}
+
+function uploadGroupStamp(input){
+  var file=input.files&&input.files[0];
+  if(!file)return;
+  if(!/^image\//.test(file.type)){toast('Please choose an image file');return}
+  if(file.size>2*1024*1024){toast('Stamp image is too large (max 2MB)');return}
+  var reader=new FileReader();
+  reader.onload=function(e){
+    DB.settings.stamp=e.target.result;
+    save();toast('Official stamp uploaded');render();
+  };
+  reader.onerror=function(){toast('Could not read that image')};
+  reader.readAsDataURL(file);
+}
+function removeGroupStamp(){
+  if(!confirm('Remove the official stamp?'))return;
+  DB.settings.stamp='';
+  save();toast('Stamp removed');render();
 }
 
 function downloadBackup(){
@@ -3019,6 +3615,8 @@ function renderModal(){
     case'campaignPayments':h=renderCampaignPaymentsModal(S.campaignFocusId);break;
     case'monthSession':h=renderMonthSessionModal();break;
     case'yearSession':h=renderYearSessionModal();break;
+    case'sessionView':h=renderSessionModal(S.sessionFocusId);break;
+    case'namesList':h=renderNamesListModal();break;
     case'dependents':h=renderDependentsModal();break;
     case'addUser':h=renderAddUserModal();break;
     case'editUser':h=renderEditUserModal();break;
@@ -3186,7 +3784,9 @@ function onPaymentMemberSearch(v){
   hiddenEl.value=m.id;
   var age=getAge(m.dob),eligible=age<MAX_AGE,monthlyBal=getMemberBalance(m.id),dedBal=getMemberDeductionBal(m.id);
   var msg='<b>'+esc(m.name)+'</b> ('+m.no+') — Age: '+age+' <span style="color:'+(eligible?'var(--green)':'var(--red)')+'">'+(eligible?'(Eligible)':'(Over '+MAX_AGE+' limit)')+'</span><br>Monthly balance: <b style="color:'+(monthlyBal>0?'var(--red)':'var(--green)')+'">'+kes(monthlyBal)+'</b> &nbsp; Deduction balance: <b style="color:'+(dedBal>0?'var(--red)':'var(--green)')+'">'+kes(dedBal)+'</b>';
-  if(dedBal>0)msg+='<br><span style="color:var(--red);font-weight:700">⚠ Outstanding deductions must be paid before recording a monthly contribution.</span>';
+  if(dedBal>0)msg+=autoDeductEnabled()
+    ?'<br><span style="color:var(--amber);font-weight:700">↪ '+kes(dedBal)+' will be automatically deducted from this payment to clear the outstanding amount. The rest goes to the monthly contribution.</span>'
+    :'<br><span style="color:var(--red);font-weight:700">⚠ Outstanding deductions must be paid before recording a monthly contribution.</span>';
   infoEl.innerHTML=msg;
 }
 
@@ -3239,7 +3839,7 @@ function renderCampaignPaymentsModal(cid){
     else actions='<button class="btn btn-sm btn-g" onclick="recordCampaignPaymentPrompt('+c.id+','+m.id+')">Record Cash</button> <button class="btn btn-sm btn-s" onclick="addCampaignMemberDeduction('+c.id+','+m.id+')">Send to Deduction</button>';
     return'<tr><td>'+esc(m.name)+'</td><td>'+esc(m.no)+'</td><td>'+kes(c.amount)+'</td><td>'+kes(paid)+'</td><td style="color:'+(bal>0?'var(--red)':'var(--green)')+'">'+kes(bal)+'</td><td><span class="pill '+statusPill+'">'+statusLabel+'</span></td><td>'+actions+'</td></tr>';
   }).join('');
-  return'<div class="mbox" style="width:min(880px,100%)"><div class="mhd"><h3>'+esc(c.title)+' — Member Payments</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;S.campaignFocusId=null;render()">✕</button></div>'+
+  return'<div class="mbox" style="width:min(880px,100%)"><div class="mhd"><h3>'+esc(c.title)+' — Member Payments</h3><div style="display:flex;gap:6px"><button class="btn btn-sm btn-s" onclick="downloadCampaignA4('+c.id+')">🖨 A4 List</button><button class="btn btn-sm btn-s" onclick="exportCampaignExcel('+c.id+')">⬇ Excel</button><button class="btn btn-sm btn-s" onclick="S.modal=null;S.campaignFocusId=null;render()">✕</button></div></div>'+
   '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">'+kes(c.amount)+' per member · Due '+(c.dueDate||'—')+' · '+eligible.length+' eligible member(s) — <span style="color:var(--green)">'+clearedCount+' cleared</span>, <span style="color:var(--red)">'+outstandingCount+' with balance</span>. Record what each member has paid in cash now, or send their remaining balance straight to Deductions instead of waiting for the due date to pass.</p>'+
   '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">'+
   '<div class="field" style="margin:0;flex:1;min-width:160px"><label>Search Member</label><input placeholder="Name or member no..." oninput="filterCampTable(this)"></div>'+
@@ -3361,8 +3961,11 @@ function addMember(){
   var msg='Registered: '+no;
   var newMember={id:id,no:no,name:name,idNo:idNo,phone:phone,house:house,dob:dob,joined:joined||getToday(),status:'Active',position:'Member'};
   if(amount>0){
-    DB.payments.push({id:DB.nid.p++,memberId:id,amount:amount,date:payDate,method:method,ref:ref.trim(),month:month||monthLabelForDate(payDate)});
-    msg+=' — contribution of '+kes(amount)+' recorded';
+    var regPay={id:DB.nid.p++,memberId:id,amount:amount,date:payDate,method:method,ref:ref.trim(),month:month||monthLabelForDate(payDate)};
+    var regSes=getActiveSession();if(regSes)regPay.sessionId=regSes.id;
+    applyAutoDeductions(regPay);
+    DB.payments.push(regPay);
+    msg+=' — contribution of '+kes(regPay.amount)+' recorded'+(regPay.deducted>0?' ('+kes(regPay.deducted)+' deducted for outstanding amounts)':'');
   }
   save();S.modal=null;toast(msg);render();
   if(amount>0)sendPaymentConfirmationSMS(newMember,amount,month||monthLabelForDate(payDate));
@@ -3435,9 +4038,14 @@ function recordPayment(){
   if(method!=='Cash'&&!ref){toast((method==='M-Pesa'?'The M-Pesa confirmation message/code':'The bank reference number')+' is required for '+method+' payments');return}
   var dupRef=findDuplicatePaymentRef(ref);
   if(dupRef){var dm=DB.members.find(function(x){return x.id===dupRef.memberId});toast('This reference/confirmation code has already been recorded — for '+(dm?dm.name:'a member')+' on '+dupRef.date+'. Duplicate payments are not allowed.');return}
-  if(!memberCanPayMonthly(mid)){toast(m.name+' has outstanding deductions of '+kes(getMemberDeductionBal(mid))+'. Clear deductions first.');return}
-  DB.payments.push({id:DB.nid.p++,memberId:mid,amount:amount,date:date||getToday(),method:method,ref:ref,month:month});
-  save();S.modal=null;toast('Payment recorded');render();
+  if(!autoDeductEnabled()&&!memberCanPayMonthly(mid)){toast(m.name+' has outstanding deductions of '+kes(getMemberDeductionBal(mid))+'. Clear deductions first.');return}
+  var pay={id:DB.nid.p++,memberId:mid,amount:amount,date:date||getToday(),method:method,ref:ref,month:month};
+  var activeSes=getActiveSession();if(activeSes)pay.sessionId=activeSes.id;
+  var ded=applyAutoDeductions(pay);
+  DB.payments.push(pay);
+  save();S.modal=null;
+  toast(ded>0?'Payment recorded — '+kes(ded)+' deducted to clear outstanding amounts, '+kes(pay.amount)+' to monthly contribution':'Payment recorded');
+  render();
   sendPaymentConfirmationSMS(m,amount,month);
 }
 
@@ -3561,9 +4169,9 @@ function filterTable(input){
 
 // ─── EXPORTS ───
 function exportMembersExcel(){
-  var csv='Member No.,Name,ID No.,Phone,House,DOB,Age,Joined,Status,Position,Monthly Balance,Total Balance\n';
+  var csv='Member No.,Name,ID No.,Phone,House,DOB,Age,Joined,Status,Position,Balance\n';
   sortByName(DB.members).forEach(function(m){
-    csv+='"'+m.no+'","'+m.name+'","'+m.idNo+'","'+m.phone+'","'+m.house+'","'+m.dob+'",'+getAge(m.dob)+',"'+m.joined+'","'+m.status+'","'+m.position+'",'+getMemberBalance(m.id)+','+getMemberTotalBalance(m.id)+'\n';
+    csv+='"'+m.no+'","'+m.name+'","'+m.idNo+'","'+m.phone+'","'+m.house+'","'+m.dob+'",'+getAge(m.dob)+',"'+m.joined+'","'+m.status+'","'+m.position+'",'+getMemberTotalBalance(m.id)+'\n';
   });
   downloadCSV(csv,'members_'+getToday()+'.csv');
 }
@@ -3615,6 +4223,35 @@ function downloadCSV(csv,filename){
   toast('Downloaded: '+filename);
 }
 
+function renderNamesListModal(){
+  var n=sortByName(DB.members).length;
+  return'<div class="mbox" style="max-width:420px"><div class="mhd"><h3>Download Members List (Names Only)</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div>'+
+  '<div style="padding:14px"><p style="font-size:.76rem;color:var(--muted);margin-bottom:14px">A simple numbered list of all '+n+' member name(s), sorted alphabetically — no other details.</p>'+
+  '<div style="display:flex;flex-direction:column;gap:8px">'+
+  '<button class="btn btn-p" onclick="downloadMembersNamesPDF()">⬇ Download as PDF</button>'+
+  '<button class="btn btn-p" onclick="downloadMembersNamesWord()">⬇ Download as Word (.doc)</button>'+
+  '<button class="btn btn-p" onclick="downloadMembersNamesExcel()">⬇ Download as Excel (.csv)</button>'+
+  '</div></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
+}
+function downloadMembersNamesPDF(){
+  var rows=sortByName(DB.members).map(function(m,i){return'<tr><td>'+(i+1)+'</td><td>'+esc(m.name)+'</td></tr>'}).join('');
+  var html='<html><head><title>'+esc(DB.settings.groupName)+' - Members (Names)</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse;margin:10px 0}th,td{padding:5px 8px;border:1px solid #ddd;text-align:left;font-size:11px}th{background:#f5f5f5}'+PDF_PRINT_FOOTER_CSS+WATERMARK_CSS+'</style></head><body>'+dlHeaderHTML()+'<h3 style="text-align:center">Members — Names List</h3><p style="color:#777;text-align:center">Generated: '+getToday()+'</p><table><thead><tr><th>No.</th><th>Name</th></tr></thead><tbody>'+rows+'</tbody></table>'+blueprintFooterHTMLStandalone()+'</body></html>';
+  openPrintableDoc(html,'members_names_'+getToday());
+}
+function downloadMembersNamesWord(){
+  var rows=sortByName(DB.members).map(function(m,i){return'<tr><td>'+(i+1)+'</td><td>'+esc(m.name)+'</td></tr>'}).join('');
+  var html='<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><title>Members</title></head><body style="font-family:Calibri,Arial,sans-serif;font-size:12pt">'+
+  '<h2 style="text-align:center">'+esc(DB.settings.groupName)+'</h2><h3 style="text-align:center">Members — Names List</h3><p style="text-align:center;color:#777">Generated: '+getToday()+'</p>'+
+  '<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;width:100%"><thead><tr><th>No.</th><th>Name</th></tr></thead><tbody>'+rows+'</tbody></table></body></html>';
+  var blob=new Blob(['\ufeff'+html],{type:'application/msword'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='members_names_'+getToday()+'.doc';document.body.appendChild(a);a.click();document.body.removeChild(a);
+  toast('Downloaded: members_names_'+getToday()+'.doc');
+}
+function downloadMembersNamesExcel(){
+  var csv='No.,Name\n';
+  sortByName(DB.members).forEach(function(m,i){csv+=(i+1)+',"'+m.name.replace(/"/g,'""')+'"\n'});
+  downloadCSV(csv,'members_names_'+getToday()+'.csv');
+}
 function downloadMembersPDF(){
   var rows=sortByName(DB.members).map(function(m){
     var age=getAge(m.dob),bal=getMemberTotalBalance(m.id),eligible=age<MAX_AGE;
@@ -3632,6 +4269,7 @@ function downloadPDF(){
 
 // ─── CHARTS ───
 function initCharts(){
+  if(typeof Chart==='undefined')return; // Chart.js loads from a CDN — skip silently if offline and not yet cached
   var ms=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug'];
   var exp=[500,500,500,500,500,500,500,500];
   var col=[400,350,500,300,200,400,200,0];

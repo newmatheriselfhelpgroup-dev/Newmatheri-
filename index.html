@@ -970,16 +970,19 @@ function downloadAllMemberCardsPDF(){
   openPrintableDoc(html,'member_id_cards_'+getToday());
 }
 
-function findDuplicateMember(idNo,name,excludeId,house){
-  idNo=(idNo||'').trim().toLowerCase();name=(name||'').trim().toLowerCase();house=(house||'').trim().toLowerCase();
-  if(!idNo&&!name)return null;
+function findDuplicateMember(idNo,name,excludeId,house,phone){
+  idNo=(idNo||'').trim().toLowerCase();name=(name||'').trim().toLowerCase().replace(/\s+/g,' ');house=(house||'').trim().toLowerCase();
+  var ph=normPhoneForDup(phone);
+  if(!idNo&&!name&&!ph)return null;
   return DB.members.find(function(m){
     if(excludeId&&m.id===excludeId)return false;
     // Strong match: same National ID number (reliable, no false positives from shared names)
     if(idNo&&m.idNo&&m.idNo.trim().toLowerCase()===idNo)return true;
+    // Strong match: same phone number (also reliable — two people rarely share one)
+    if(ph&&ph.length>=7&&normPhoneForDup(m.phone)===ph)return true;
     // Weak match: same full name AND same house — avoids flagging two different
     // members who simply happen to share a name but live in different houses.
-    if(name&&m.name&&m.name.trim().toLowerCase()===name&&house&&m.house&&m.house.trim().toLowerCase()===house)return true;
+    if(name&&m.name&&m.name.trim().toLowerCase().replace(/\s+/g,' ')===name&&house&&m.house&&m.house.trim().toLowerCase()===house)return true;
     return false;
   })||null;
 }
@@ -990,6 +993,89 @@ function findDuplicatePaymentRef(ref,excludeId){
     if(excludeId&&p.id===excludeId)return false;
     return p.ref&&p.ref.trim().toLowerCase()===ref;
   })||null;
+}
+function normNameForDup(s){return(s||'').trim().toLowerCase().replace(/\s+/g,' ')}
+function normPhoneForDup(s){return(s||'').replace(/[^0-9]/g,'').replace(/^0+/,'').slice(-9)}
+// Clusters members who look like the same person entered more than once — same
+// National ID, same phone number, or the same full name — even if they were
+// entered under different house/ID combinations. Union-find so a member linked
+// to two different duplicates by two different signals still lands in one group.
+function findDuplicateMemberGroups(){
+  var members=DB.members;
+  var parent=members.map(function(_,i){return i});
+  function find(x){while(parent[x]!==x){parent[x]=parent[parent[x]];x=parent[x]}return x}
+  function union(a,b){var ra=find(a),rb=find(b);if(ra!==rb)parent[ra]=rb}
+  var byName={},byId={},byPhone={};
+  members.forEach(function(m,i){
+    var nm=normNameForDup(m.name);if(nm)(byName[nm]=byName[nm]||[]).push(i);
+    var idn=(m.idNo||'').trim().toLowerCase();if(idn)(byId[idn]=byId[idn]||[]).push(i);
+    var ph=normPhoneForDup(m.phone);if(ph&&ph.length>=7)(byPhone[ph]=byPhone[ph]||[]).push(i);
+  });
+  [byName,byId,byPhone].forEach(function(map){
+    Object.keys(map).forEach(function(k){var idxs=map[k];for(var j=1;j<idxs.length;j++)union(idxs[0],idxs[j])});
+  });
+  var groups={};
+  members.forEach(function(m,i){var r=find(i);(groups[r]=groups[r]||[]).push(m)});
+  return Object.keys(groups).map(function(k){return groups[k]}).filter(function(g){return g.length>1});
+}
+function memberRecordCounts(id){
+  return{
+    payments:DB.payments.filter(function(p){return p.memberId===id}).length,
+    deductions:DB.deductions.filter(function(d){return d.memberId===id}).length,
+    campaignPayments:DB.campaignPayments.filter(function(c){return c.memberId===id}).length,
+    dependents:(DB.dependents||[]).filter(function(d){return d.memberId===id}).length
+  };
+}
+// Folds every record that belongs to the duplicate ids onto the id being kept,
+// then removes the now-empty duplicate member entries. Nothing is lost — payment
+// and deduction history simply moves onto the surviving member record.
+function mergeMembers(keepId,mergeIds){
+  keepId=parseInt(keepId);
+  mergeIds.forEach(function(mid){
+    mid=parseInt(mid);
+    if(mid===keepId)return;
+    DB.payments.forEach(function(p){if(p.memberId===mid)p.memberId=keepId});
+    DB.deductions.forEach(function(d){if(d.memberId===mid)d.memberId=keepId});
+    (DB.deductionPayments||[]).forEach(function(d){if(d.memberId===mid)d.memberId=keepId});
+    DB.campaignPayments.forEach(function(c){if(c.memberId===mid)c.memberId=keepId});
+    (DB.dependents||[]).forEach(function(d){if(d.memberId===mid)d.memberId=keepId});
+    DB.users.forEach(function(u){if(u.memberId===mid)u.memberId=keepId});
+    Object.keys(DB.settings.houseReps||{}).forEach(function(h){if(DB.settings.houseReps[h]===mid)DB.settings.houseReps[h]=keepId});
+    DB.members=DB.members.filter(function(m){return m.id!==mid});
+  });
+  save();
+}
+function doMergeDuplicateGroup(groupIdsCsv){
+  if(!checkEditPassword('merge these duplicate members'))return;
+  var ids=groupIdsCsv.split(',').map(function(x){return parseInt(x)});
+  var sel=document.querySelector('input[name="keep_'+groupIdsCsv+'"]:checked');
+  if(!sel){toast('Choose which record to keep first');return}
+  var keepId=parseInt(sel.value);
+  var mergeIds=ids.filter(function(id){return id!==keepId});
+  if(!confirm('Merge '+mergeIds.length+' duplicate record(s) into the selected member? Their payments, deductions and other history will move onto the kept record, and the duplicate entries will be removed. This cannot be undone.'))return;
+  mergeMembers(keepId,mergeIds);
+  toast('Duplicates merged');
+  render();
+}
+function renderDuplicateMembersModal(){
+  var groups=findDuplicateMemberGroups();
+  if(!groups.length){
+    return'<div class="mbox" style="max-width:480px"><div class="mhd"><h3>Find Duplicate Members</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div><div style="padding:20px;text-align:center;color:var(--muted)">✅ No duplicate members found — matched by National ID, phone number, and full name.</div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
+  }
+  var totalDupRecords=groups.reduce(function(s,g){return s+g.length-1},0);
+  var body=groups.map(function(g){
+    var idsCsv=g.map(function(m){return m.id}).join(',');
+    var rows=g.map(function(m){
+      var c=memberRecordCounts(m.id);
+      var hasHistory=c.payments+c.deductions+c.campaignPayments+c.dependents>0;
+      return'<label style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;cursor:pointer;background:'+(hasHistory?'#F5FAF5':'#fff')+'"><input type="radio" name="keep_'+idsCsv+'" value="'+m.id+'" '+(hasHistory?'checked':'')+' style="margin-top:3px"><div style="font-size:.74rem"><b>'+esc(m.name)+'</b> ('+esc(m.no)+')<br><span style="color:var(--muted)">ID: '+esc(m.idNo||'—')+' &nbsp;|&nbsp; Phone: '+esc(m.phone||'—')+' &nbsp;|&nbsp; House: '+esc(m.house||'—')+' &nbsp;|&nbsp; Joined: '+esc(m.joined||'—')+'</span><br><span style="color:'+(hasHistory?'var(--green)':'var(--muted)')+';font-weight:'+(hasHistory?'700':'400')+'">'+c.payments+' payment(s), '+c.deductions+' deduction(s), '+c.campaignPayments+' campaign payment(s), '+c.dependents+' dependent(s)</span></div></label>';
+    }).join('');
+    return'<div style="border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px"><p style="font-size:.72rem;color:var(--muted);margin-bottom:8px">Choose which record to <b>keep</b> — its history stays, the others merge into it and are removed.</p>'+rows+'<button class="btn btn-sm btn-d" style="margin-top:4px" onclick="doMergeDuplicateGroup(\''+idsCsv+'\')">Merge this group</button></div>';
+  }).join('');
+  return'<div class="mbox" style="max-width:640px"><div class="mhd"><h3>Find Duplicate Members</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div>'+
+  '<p style="font-size:.74rem;color:var(--muted);margin:0 0 10px">Found '+groups.length+' group(s) covering '+totalDupRecords+' extra duplicate record(s), matched by National ID, phone number, or full name.</p>'+
+  '<div style="max-height:60vh;overflow:auto">'+body+'</div>'+
+  '<div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
 }
 function totalCollected(){return DB.payments.reduce(function(s,p){return s+p.amount},0)+DB.campaignPayments.reduce(function(s,p){return s+p.amount},0)+(DB.deductionPayments||[]).reduce(function(s,p){return s+p.amount},0)}
 function totalExpenses(){return DB.expenses.filter(function(e){return e.status==='Approved'}).reduce(function(s,e){return s+e.amount},0)}
@@ -2814,7 +2900,7 @@ function renderAdminMembers(){
   return'<div class="pnl"><div class="pnl-t"><h3>Bulk Member Registration</h3></div><div style="padding:14px"><p style="font-size:.74rem;color:var(--muted);margin-bottom:10px">Register multiple members at once directly in the system — no file to download or fill offline. Add a row per member and, optionally, record a contribution they\'ve already paid at the same time. Up to <b>'+MAX_BULK_ROWS+' members</b> per batch. Members with an age of '+MAX_AGE+'+ or matching an existing name/ID will be skipped automatically.</p><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><button class="btn btn-p" onclick="openBulkRegisterModal()">+ Open Bulk Registration Form</button><button class="btn btn-s" onclick="openBulkPasteModal()">📋 Paste from Excel</button><label class="btn btn-s" style="margin:0">⬆ Upload Excel/CSV File<input type="file" accept=".csv,.xlsx,.xls" onchange="handleBulkUpload(event)" style="display:none"></label><button class="btn btn-s" onclick="downloadMemberTemplate()">⬇ Excel Template</button></div><p style="font-size:.68rem;color:var(--muted);margin-top:8px">Upload accepts .xlsx, .xls or .csv files matching the template column order — every row is recorded exactly as uploaded (skipped rows, if any, are listed after upload with the reason).</p></div></div>'+
   '<div class="pnl"><div class="pnl-t" style="flex-wrap:wrap;gap:8px"><h3>Manage Members (Add / Edit / Delete)</h3><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">'+
   (selCount?'<span style="font-size:.7rem;color:var(--muted);font-weight:700">'+selCount+' selected</span><button class="btn btn-sm btn-s" onclick="openBulkEditMembersModal()">✎ Bulk Edit</button><button class="btn btn-sm btn-d" onclick="bulkDeleteMembers()">🗑 Delete Selected</button>':'')+
-  '<button class="btn btn-sm btn-s" onclick="exportMembersExcel()">⬇ Excel</button><button class="btn btn-sm btn-s" onclick="downloadMembersPDF()">⬇ PDF</button><button class="btn btn-sm btn-s" onclick="S.modal=\'namesList\';render()">📋 Names List</button><button class="btn btn-sm btn-s" onclick="scanMemberByNumber()">🔍 Scan ID Card</button><button class="btn btn-sm btn-s" onclick="downloadAllMemberCardsPDF()">🪪 Download All Cards</button><button class="btn btn-sm btn-s" onclick="renumberAllMembersToNMSHG()">🔢 Renumber to NMSHG-M format</button><button class="btn btn-sm btn-p" onclick="S.modal=\'addMember\';render()">+ Add</button></div></div><table><thead><tr><th><input type="checkbox" onclick="toggleAllMemberSel(['+ids.join(',')+'])" '+(allChecked?'checked':'')+'></th><th>No.</th><th>Name</th><th>ID No.</th><th>Phone</th><th>House</th><th>DOB</th><th>Age</th><th>Eligibility</th><th>Joined</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+list.map(function(m){
+  '<button class="btn btn-sm btn-s" onclick="exportMembersExcel()">⬇ Excel</button><button class="btn btn-sm btn-s" onclick="downloadMembersPDF()">⬇ PDF</button><button class="btn btn-sm btn-s" onclick="S.modal=\'namesList\';render()">📋 Names List</button><button class="btn btn-sm btn-s" onclick="scanMemberByNumber()">🔍 Scan ID Card</button><button class="btn btn-sm btn-d" onclick="S.modal=\'dupMembers\';render()">🧬 Find Duplicates</button><button class="btn btn-sm btn-s" onclick="downloadAllMemberCardsPDF()">🪪 Download All Cards</button><button class="btn btn-sm btn-s" onclick="renumberAllMembersToNMSHG()">🔢 Renumber to NMSHG-M format</button><button class="btn btn-sm btn-p" onclick="S.modal=\'addMember\';render()">+ Add</button></div></div><table><thead><tr><th><input type="checkbox" onclick="toggleAllMemberSel(['+ids.join(',')+'])" '+(allChecked?'checked':'')+'></th><th>No.</th><th>Name</th><th>ID No.</th><th>Phone</th><th>House</th><th>DOB</th><th>Age</th><th>Eligibility</th><th>Joined</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+list.map(function(m){
     var age=getAge(m.dob),eligible=age<MAX_AGE,checked=!!(S.bulkMemberSel&&S.bulkMemberSel[m.id]);
     return'<tr><td><input type="checkbox" onclick="toggleMemberSel('+m.id+')" '+(checked?'checked':'')+'></td><td>'+esc(m.no)+'</td><td><b>'+esc(m.name)+'</b></td><td>'+esc(m.idNo)+'</td><td>'+esc(m.phone)+'</td><td>'+esc(m.house)+'</td><td>'+esc(m.dob)+'</td><td'+(age>=MAX_AGE?' style="color:var(--red);font-weight:700"':'')+'>'+age+'</td><td><span class="pill '+(eligible?'pill-g':'pill-r')+'">'+(eligible?'Eligible':'Over limit')+'</span></td><td>'+m.joined+'</td><td><span class="pill '+(m.status==='Active'?'pill-g':'pill-r')+'">'+m.status+'</span></td><td><button class="btn btn-sm btn-s" onclick="S.modal=\'editMember\';S.editMemberId='+m.id+';render()">Edit</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'idCard\';S.viewMemberId='+m.id+';render()">🪪 Card</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'dependents\';S.viewMemberId='+m.id+';render()">👨‍👩‍👧 Dependents</button> <button class="btn btn-sm btn-d" onclick="deleteMember('+m.id+')">Delete</button></td></tr>';
   }).join('')+'</tbody></table></div>';
@@ -2957,7 +3043,7 @@ function processBulkRows(dataRows){
     var amount=parseInt(cols[6])||0,month=cols[7]||'',payDate=cols[8]||getToday(),method=normalizePaymentMethod(cols[9]),ref=cols[10]||'';
     if(!name){skippedInvalid++;continue}
     if(dob){var age=getAge(dob);if(age>=MAX_AGE){skippedAge++;skipDetails.push(name+' — over age limit ('+age+')');continue}}
-    var dupM=findDuplicateMember(idNo,name,null,house);
+    var dupM=findDuplicateMember(idNo,name,null,house,phone);
     if(dupM){skippedDup++;skipDetails.push(name+' — duplicate of existing member '+dupM.name+' ('+dupM.no+')');continue}
     var id=nid('m');var no=getNextMemberNo();
     DB.members.push({id:id,no:no,name:name,idNo:idNo,phone:phone,house:house,dob:dob,joined:joined,status:'Active',position:'Member'});
@@ -3193,7 +3279,7 @@ function submitBulkRegister(){
     var house=r.house||DB.settings.houses[0],idNo=(r.idNo||'').trim(),phone=r.phone||'',dob=r.dob||'',joined=r.joined||getToday();
     var amount=parseInt(r.amount)||0,month=r.month||'',payDate=r.payDate||getToday(),method=normalizePaymentMethod(r.method),ref=r.ref||'';
     if(dob){var age=getAge(dob);if(age>=MAX_AGE){skippedAge++;skipDetails.push(name+' — over age limit ('+age+')');return}}
-    var dupM=findDuplicateMember(idNo,name,null,house);
+    var dupM=findDuplicateMember(idNo,name,null,house,phone);
     if(dupM){skippedDup++;skipDetails.push(name+' — duplicate of existing member '+dupM.name+' ('+dupM.no+')');return}
     var id=nid('m');var no=getNextMemberNo();
     DB.members.push({id:id,no:no,name:name,idNo:idNo,phone:phone,house:house,dob:dob,joined:joined,status:'Active',position:'Member'});
@@ -3672,6 +3758,7 @@ function renderModal(){
     case'yearSession':h=renderYearSessionModal();break;
     case'sessionView':h=renderSessionModal(S.sessionFocusId);break;
     case'namesList':h=renderNamesListModal();break;
+    case'dupMembers':h=renderDuplicateMembersModal();break;
     case'dependents':h=renderDependentsModal();break;
     case'addUser':h=renderAddUserModal();break;
     case'editUser':h=renderEditUserModal();break;
@@ -3696,9 +3783,9 @@ function onRegMethodChange(){
 
 function checkRegistrationDuplicate(){
   var el=document.getElementById('mDupWarn');if(!el)return;
-  var name=document.getElementById('mName').value,idNo=document.getElementById('mId').value,dob=document.getElementById('mDob').value;
+  var name=document.getElementById('mName').value,idNo=document.getElementById('mId').value,dob=document.getElementById('mDob').value,phone=(document.getElementById('mPhone')||{}).value;
   var msgs=[];
-  var dup=findDuplicateMember(idNo,name);
+  var dup=findDuplicateMember(idNo,name,null,null,phone);
   if(dup)msgs.push('<span style="color:var(--red);font-weight:700">⚠ Possible duplicate: '+esc(dup.name)+' ('+dup.no+') is already registered.</span>');
   if(dob){var age=getAge(dob);if(age>=MAX_AGE)msgs.push('<span style="color:var(--red);font-weight:700">⚠ Age '+age+' exceeds the '+MAX_AGE+'-year eligibility limit.</span>')}
   el.innerHTML=msgs.join('<br>');
@@ -4009,7 +4096,7 @@ function addMember(){
   if(dob){var age=getAge(dob);if(age>=MAX_AGE){toast('Cannot register: member is '+age+' years old ('+MAX_AGE+'+ limit)');return}}
   if(amount>0&&method!=='Cash'&&!ref.trim()){toast((method==='M-Pesa'?'The M-Pesa confirmation message/code':'The bank reference number')+' is required for '+method+' payments');return}
   if(amount>0&&method!=='Cash'){var dupRef=findDuplicatePaymentRef(ref);if(dupRef){var dm=DB.members.find(function(x){return x.id===dupRef.memberId});toast('This reference/confirmation code has already been recorded — for '+(dm?dm.name:'a member')+' on '+dupRef.date+'. Duplicate payments are not allowed.');return}}
-  var dup=findDuplicateMember(idNo,name);
+  var dup=findDuplicateMember(idNo,name,null,null,phone);
   if(dup&&!confirm('A member matching this name/ID already exists: '+dup.name+' ('+dup.no+'). Register anyway?'))return;
   var id=nid('m');var no=getNextMemberNo();
   DB.members.push({id:id,no:no,name:name,idNo:idNo,phone:phone,house:house,dob:dob,joined:joined||getToday(),status:'Active',position:'Member'});

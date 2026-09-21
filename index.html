@@ -2121,7 +2121,7 @@ function renderDeductions(){
 
   function buildRow(d){
     var bal=d.amount-d.paid;
-    var actions=(canEdit&&bal>0)?'<button class="btn btn-sm btn-g" onclick="payDeductionPrompt('+d.id+')">Record Payment</button>':'';
+    var actions=canEdit?((bal>0?'<button class="btn btn-sm btn-g" onclick="payDeductionPrompt('+d.id+')">Record Payment</button> ':'')+'<button class="btn btn-sm btn-s" onclick="S.modal=\'dedPayments\';S.dedHistId='+d.id+';render()">Payments</button>'):'';
     return'<tr><td>'+esc(d.reason)+'</td><td><span class="pill '+(d.source==='campaign'?'pill-a':'pill-b')+'">'+deductionTypeLabel(d)+'</span></td><td>'+kes(d.amount)+'</td><td>'+kes(d.paid)+'</td><td style="font-weight:700;color:'+(bal>0?'var(--red)':'var(--green)')+'">'+kes(bal)+'</td><td>'+d.date+'</td>'+(canEdit?'<td>'+actions+'</td>':'')+'</tr>';
   }
   var theadCols='<th>Reason</th><th>Type</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Date</th>'+(canEdit?'<th>Actions</th>':'');
@@ -2182,6 +2182,70 @@ function renderEditDeductionModal(){
   var d=DB.deductions.find(function(x){return x.id===S.editMemberId});
   if(!d)return'<div class="mbox"><p>Not found</p></div>';
   return'<div class="mbox"><div class="mhd"><h3>Edit Deduction</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div><div class="fg"><div class="field"><label>Member</label><select id="edMem">'+sortByName(DB.members).map(function(m){return'<option value="'+m.id+'"'+(d.memberId===m.id?' selected':'')+'>'+esc(m.name)+' ('+m.no+')</option>'}).join('')+'</select></div><div class="field"><label>Reason</label><input id="edRsn" value="'+esc(d.reason)+'"></div><div class="field"><label>Amount</label><input id="edAmt" type="number" value="'+d.amount+'"></div><div class="field"><label>Amount Already Paid</label><input id="edPaid" type="number" value="'+d.paid+'"></div><div class="field"><label>Date</label><input id="edDate" type="date" value="'+d.date+'"></div></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Cancel</button><button class="btn btn-p" onclick="saveDeductionEdit('+d.id+')">Save Changes</button></div></div>';
+}
+
+// ---- Payments made towards ONE deduction: see them, and undo one that was recorded (or left behind) by mistake ----
+function dedRecoveryInfo(d){
+  var isCamp=d.source==='campaign'&&!!d.campaignId;
+  var byDate=function(a,b){return String(a.date||'').localeCompare(String(b.date||''))||a.id-b.id};
+  var recs=(isCamp?DB.campaignPayments:(DB.deductionPayments||[])).filter(function(r){return r.deductionId===d.id}).sort(byDate);
+  // Monthly payments that still exist and took money for this deduction (matched one-to-one against the records).
+  var items=[];
+  DB.payments.forEach(function(pay){
+    if(pay.memberId!==d.memberId)return;
+    (pay.deductionItems||[]).forEach(function(it){if(it.deductionId===d.id)items.push({pay:pay,amount:it.amount,used:false})});
+  });
+  var rows=recs.map(function(r){
+    var kind='direct',owner=null;
+    if(r.viaDeduction){
+      var it=items.find(function(x){return !x.used&&x.amount===r.amount&&x.pay.date===r.date})||items.find(function(x){return !x.used&&x.amount===r.amount});
+      if(it){it.used=true;kind='linked';owner=it.pay}else kind='orphan';
+    }
+    return{r:r,kind:kind,owner:owner};
+  });
+  var listed=recs.reduce(function(t,r){return t+r.amount},0);
+  return{isCamp:isCamp,rows:rows,untracked:Math.max(0,(d.paid||0)-listed)};
+}
+function renderDedPaymentsModal(){
+  var d=DB.deductions.find(function(x){return x.id===S.dedHistId});
+  if(!d)return'<div class="mbox"><p>Not found</p></div>';
+  var m=DB.members.find(function(x){return x.id===d.memberId});
+  var info=dedRecoveryInfo(d),bal=d.amount-d.paid;
+  var rows=info.rows.map(function(x){
+    var r=x.r,note,btn='';
+    if(x.kind==='linked'){note='Taken from the monthly payment of '+esc(x.owner.date)+' &mdash; to change it, edit or delete that payment in Contributions'}
+    else{
+      note=x.kind==='orphan'?'<span style="color:var(--red)">The monthly payment this came from no longer exists</span>':'Recorded directly against this deduction';
+      btn='<button class="btn btn-sm btn-d" onclick="removeDedRecovery('+r.id+')">Remove</button>';
+    }
+    return'<tr><td>'+esc(r.date||'')+'</td><td>'+kes(r.amount)+'</td><td>'+esc(r.method||'')+'</td><td style="font-size:.68rem;color:var(--muted)">'+note+'</td><td>'+btn+'</td></tr>';
+  }).join('');
+  if(info.untracked>0)rows+='<tr><td>--</td><td>'+kes(info.untracked)+'</td><td>--</td><td style="font-size:.68rem;color:var(--muted)">Counted as paid but has no dated record (for example entered when the deduction was created or edited)</td><td><button class="btn btn-sm btn-d" onclick="removeDedUntracked('+d.id+')">Remove</button></td></tr>';
+  return'<div class="mbox" style="width:min(760px,100%)"><div class="mhd"><h3>'+esc(m?m.name:'Member')+' &mdash; '+esc(d.reason)+'</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">&#10005;</button></div>'+
+  '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">Deduction '+kes(d.amount)+' &middot; paid '+kes(d.paid)+' &middot; <b style="color:'+(bal>0?'var(--red)':'var(--green)')+'">balance '+kes(bal)+'</b>. <b>Remove</b> a payment that should not be there &mdash; the balance goes back up and the money is taken out of the totals.</p>'+
+  '<div style="max-height:50vh;overflow:auto"><table><thead><tr><th>Date</th><th>Amount</th><th>Method</th><th>Where it came from</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="5" style="text-align:center;color:var(--muted)">No payments recorded towards this deduction</td></tr>')+'</tbody></table></div>'+
+  '<div class="mft"><button class="btn btn-p" onclick="S.modal=null;render()">Done</button></div></div>';
+}
+function dedSetStatus(d){if(d.status==='Outstanding'||d.status==='Cleared')d.status=d.paid>=d.amount?'Cleared':'Outstanding'}
+function removeDedRecovery(recId){
+  var d=DB.deductions.find(function(x){return x.id===S.dedHistId});if(!d)return;
+  var info=dedRecoveryInfo(d);
+  var x=info.rows.find(function(y){return y.r.id===recId});
+  if(!x||x.kind==='linked')return;
+  if(!checkEditPassword('remove this deduction payment'))return;
+  if(!confirm('Remove this '+kes(x.r.amount)+' payment? The deduction balance will go up by '+kes(x.r.amount)+'.'))return;
+  if(info.isCamp)DB.campaignPayments=DB.campaignPayments.filter(function(r){return r.id!==recId});
+  else DB.deductionPayments=DB.deductionPayments.filter(function(r){return r.id!==recId});
+  d.paid=Math.max(0,(d.paid||0)-x.r.amount);dedSetStatus(d);
+  save();toast('Payment removed -- deduction balance is now '+kes(d.amount-d.paid));render();
+}
+function removeDedUntracked(id){
+  var d=DB.deductions.find(function(x){return x.id===id});if(!d)return;
+  var info=dedRecoveryInfo(d);if(info.untracked<=0)return;
+  if(!checkEditPassword('remove this deduction payment'))return;
+  if(!confirm('Remove '+kes(info.untracked)+' that is counted as paid but has no dated record? The deduction balance will go up by that amount.'))return;
+  d.paid=Math.max(0,(d.paid||0)-info.untracked);dedSetStatus(d);
+  save();toast('Removed -- deduction balance is now '+kes(d.amount-d.paid));render();
 }
 
 function saveDeductionEdit(id){
@@ -3097,7 +3161,7 @@ function renderAdminDeductions(){
     var m=DB.members.find(function(x){return x.id===d.memberId});
     var bal=d.amount-d.paid;
     var camp=d.source==='campaign'?DB.campaigns.find(function(x){return x.id===d.campaignId}):null;
-    return'<tr data-search="'+esc(((m?m.name+' '+m.no:'')+' '+d.reason).toLowerCase())+'" data-campaign="'+(camp?camp.id:'')+'"><td>'+esc(m?m.name:'—')+'</td><td>'+esc(d.reason)+'</td><td><span class="pill '+(d.source==='campaign'?'pill-a':'pill-b')+'">'+deductionTypeLabel(d)+'</span></td><td>'+(camp?esc(camp.title):'<span style="color:var(--muted)">—</span>')+'</td><td>'+kes(d.amount)+'</td><td>'+kes(d.paid)+'</td><td style="font-weight:700;color:'+(bal>0?'var(--red)':'var(--green)')+'">'+kes(bal)+'</td><td>'+d.date+'</td><td><span class="pill '+(d.status==='Outstanding'?'pill-r':'pill-g')+'">'+d.status+'</span></td><td><button class="btn btn-sm btn-s" onclick="S.modal=\'editDeduction\';S.editMemberId='+d.id+';render()">Edit</button> <button class="btn btn-sm btn-d" onclick="deleteDeduction('+d.id+')">Delete</button></td></tr>';
+    return'<tr data-search="'+esc(((m?m.name+' '+m.no:'')+' '+d.reason).toLowerCase())+'" data-campaign="'+(camp?camp.id:'')+'"><td>'+esc(m?m.name:'—')+'</td><td>'+esc(d.reason)+'</td><td><span class="pill '+(d.source==='campaign'?'pill-a':'pill-b')+'">'+deductionTypeLabel(d)+'</span></td><td>'+(camp?esc(camp.title):'<span style="color:var(--muted)">—</span>')+'</td><td>'+kes(d.amount)+'</td><td>'+kes(d.paid)+'</td><td style="font-weight:700;color:'+(bal>0?'var(--red)':'var(--green)')+'">'+kes(bal)+'</td><td>'+d.date+'</td><td><span class="pill '+(d.status==='Outstanding'?'pill-r':'pill-g')+'">'+d.status+'</span></td><td><button class="btn btn-sm btn-g" onclick="S.modal=\'dedPayments\';S.dedHistId='+d.id+';render()">Payments</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'editDeduction\';S.editMemberId='+d.id+';render()">Edit</button> <button class="btn btn-sm btn-d" onclick="deleteDeduction('+d.id+')">Delete</button></td></tr>';
   }
   var thead='<thead><tr><th>Member</th><th>Reason</th><th>Type</th><th>Campaign</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Date</th><th>Status</th><th>Actions</th></tr></thead>';
   return'<div class="pnl"><div class="pnl-t"><h3>Manage Deductions</h3><button class="btn btn-sm btn-p" onclick="S.modal=\'addDeduction\';render()">+ New Deduction</button></div><div style="padding:14px 14px 0;display:flex;gap:10px;flex-wrap:wrap"><div class="field" style="max-width:280px;margin:0"><label>Search</label><input id="dedAdminSearch" placeholder="Member, reason..." oninput="filterAdminDeductions()"></div><div class="field" style="max-width:240px;margin:0"><label>Filter by Campaign</label><select id="dedAdminCampaign" onchange="filterAdminDeductions()">'+campaignOptions+'</select></div></div></div>'+
@@ -4006,6 +4070,7 @@ function renderModal(){
     case'editCampaign':h=renderEditCampaignModal();break;
     case'addDeduction':h=renderAddDeductionModal();break;
     case'editDeduction':h=renderEditDeductionModal();break;
+    case'dedPayments':h=renderDedPaymentsModal();break;
     case'addMinute':h=renderAddMinuteModal();break;
     case'editMinute':h=renderEditMinuteModal();break;
     case'addLetter':h=renderAddLetterModal();break;
@@ -4019,6 +4084,7 @@ function renderModal(){
     case'addAssetIncome':h=renderAddAssetIncomeModal();break;
     case'editAssetIncome':h=renderEditAssetIncomeModal();break;
     case'campaignPayments':h=renderCampaignPaymentsModal(S.campaignFocusId);break;
+    case'editCampPay':h=renderEditCampPayModal();break;
     case'monthSession':h=renderMonthSessionModal();break;
     case'yearSession':h=renderYearSessionModal();break;
     case'sessionView':h=renderSessionModal(S.sessionFocusId);break;
@@ -4261,11 +4327,11 @@ function renderCampaignPaymentsModal(cid){
     var m=r.m,paid=r.paid,bal=r.bal,dedRow=r.dedRow;
     var statusLabel=campaignMemberStatusLabel(bal,dedRow);
     var statusPill=statusLabel==='Paid'||statusLabel==='Cleared via Deduction'?'pill-g':(statusLabel==='Pending in Deductions'?'pill-a':'pill-r');
-    var actions;
+    var actions,editBtn=canEditCampPay()&&DB.campaignPayments.some(function(q){return q.campaignId===c.id&&q.memberId===m.id&&isDirectCampPay(q)})?' <button class="btn btn-sm btn-s" onclick="S.modal=\'editCampPay\';S.campEditCid='+c.id+';S.campEditMid='+m.id+';render()">Edit Paid</button>':'';
     if(bal<=0)actions='<span style="color:var(--muted);font-size:.68rem">Fully paid</span>';
     else if(dedRow)actions='<button class="btn btn-sm btn-s" onclick="S.modal=null;S.campaignFocusId=null;nav(\'deductions\')">Manage in Deductions</button>';
     else actions='<button class="btn btn-sm btn-g" onclick="recordCampaignPaymentPrompt('+c.id+','+m.id+')">Record Cash</button> <button class="btn btn-sm btn-s" onclick="addCampaignMemberDeduction('+c.id+','+m.id+')">Send to Deduction</button>';
-    return'<tr><td>'+esc(m.name)+'</td><td>'+esc(m.no)+'</td><td>'+kes(c.amount)+'</td><td>'+kes(paid)+'</td><td style="color:'+(bal>0?'var(--red)':'var(--green)')+'">'+kes(bal)+'</td><td><span class="pill '+statusPill+'">'+statusLabel+'</span></td><td>'+actions+'</td></tr>';
+    return'<tr><td>'+esc(m.name)+'</td><td>'+esc(m.no)+'</td><td>'+kes(c.amount)+'</td><td>'+kes(paid)+'</td><td style="color:'+(bal>0?'var(--red)':'var(--green)')+'">'+kes(bal)+'</td><td><span class="pill '+statusPill+'">'+statusLabel+'</span></td><td>'+actions+editBtn+'</td></tr>';
   }).join('');
   return'<div class="mbox" style="width:min(880px,100%)"><div class="mhd"><h3>'+esc(c.title)+' — Member Payments</h3><div style="display:flex;gap:6px"><button class="btn btn-sm btn-s" onclick="downloadCampaignA4('+c.id+')">🖨 A4 List</button><button class="btn btn-sm btn-s" onclick="exportCampaignExcel('+c.id+')">⬇ Excel</button><button class="btn btn-sm btn-s" onclick="S.modal=null;S.campaignFocusId=null;render()">✕</button></div></div>'+
   '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">'+kes(c.amount)+' per member · Due '+(c.dueDate||'—')+' · '+eligible.length+' eligible member(s) — <span style="color:var(--green)">'+clearedCount+' cleared</span>, <span style="color:var(--red)">'+outstandingCount+' with balance</span>. Record what each member has paid in cash now, or send their remaining balance straight to Deductions instead of waiting for the due date to pass.</p>'+
@@ -4297,6 +4363,65 @@ function recordCampaignPaymentPrompt(cid,mid){
   if(amt>bal)amt=bal;
   DB.campaignPayments.push({id:nid('cp'),campaignId:cid,memberId:mid,amount:amt,date:getToday(),method:'Cash'});
   save();toast('Payment recorded for '+m.name);render();
+}
+
+// ---- Edit / delete the payments recorded against an Other Contribution (campaign) ----
+// Only payments recorded directly against the campaign ("Record Cash") can be changed here. Money that
+// came out of a member's monthly contribution, or was paid through the Deductions page, belongs to those
+// records and is changed there -- otherwise it would simply be re-created.
+function isDirectCampPay(p){return !p.deductionId&&!p.viaDeduction}
+function canEditCampPay(){return S.role==='Admin'||S.role==='Secretary'}
+// If this member's unpaid balance was already sent to Deductions, keep that deduction equal to what is still owed.
+function resyncCampaignDeduction(cid,mid){
+  var c=DB.campaigns.find(function(x){return x.id===cid});
+  var d=DB.deductions.find(function(x){return x.source==='campaign'&&x.campaignId===cid&&x.memberId===mid});
+  if(!c||!d||(d.status!=='Outstanding'&&d.status!=='Cleared'))return;
+  var cash=DB.campaignPayments.filter(function(p){return p.campaignId===cid&&p.memberId===mid&&isDirectCampPay(p)}).reduce(function(t,p){return t+p.amount},0);
+  d.amount=Math.max(0,c.amount-cash);
+  d.status=(d.paid||0)>=d.amount?'Cleared':'Outstanding';
+}
+function renderEditCampPayModal(){
+  var c=DB.campaigns.find(function(x){return x.id===S.campEditCid}),m=DB.members.find(function(x){return x.id===S.campEditMid});
+  if(!c||!m)return'<div class="mbox"><p>Not found</p></div>';
+  var list=DB.campaignPayments.filter(function(p){return p.campaignId===c.id&&p.memberId===m.id}).sort(function(a,b){return(a.date||'').localeCompare(b.date||'')||a.id-b.id});
+  var paid=list.reduce(function(t,p){return t+p.amount},0),bal=c.amount-paid;
+  var inp='border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:.76rem';
+  var rows=list.map(function(p){
+    if(isDirectCampPay(p)){
+      var methods=['Cash','M-Pesa','Bank Transfer'];if(p.method&&methods.indexOf(p.method)===-1)methods.push(p.method);
+      return'<tr><td><input type="date" id="cpd_'+p.id+'" value="'+esc(p.date||'')+'" style="'+inp+'"></td><td><input type="number" id="cpa_'+p.id+'" value="'+p.amount+'" min="1" style="width:90px;'+inp+'"></td><td><select id="cpm_'+p.id+'" style="'+inp+'">'+methods.map(function(x){return'<option'+((p.method||'Cash')===x?' selected':'')+'>'+esc(x)+'</option>'}).join('')+'</select></td><td style="white-space:nowrap"><button class="btn btn-sm btn-p" onclick="saveCampPayment('+p.id+')">Save</button> <button class="btn btn-sm btn-d" onclick="deleteCampPayment('+p.id+')">Delete</button></td></tr>';
+    }
+    return'<tr><td>'+esc(p.date||'')+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method||'')+'</td><td style="font-size:.68rem;color:var(--muted)">'+(p.viaDeduction?'Taken from a monthly contribution &mdash; change it by editing that monthly payment':'Paid through Deductions &mdash; change it in the Deductions page')+'</td></tr>';
+  }).join('');
+  return'<div class="mbox" style="width:min(720px,100%)"><div class="mhd"><h3>'+esc(m.name)+' &mdash; '+esc(c.title)+'</h3><button class="btn btn-sm btn-s" onclick="S.modal=\'campaignPayments\';render()">&#10005;</button></div>'+
+  '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">Required '+kes(c.amount)+' &middot; paid '+kes(paid)+' &middot; <b style="color:'+(bal>0?'var(--red)':'var(--green)')+'">balance '+kes(bal)+'</b>. Change the amount, date or method and tap Save, or Delete a payment that was recorded by mistake.</p>'+
+  '<div style="max-height:50vh;overflow:auto"><table><thead><tr><th>Date</th><th>Amount</th><th>Method</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan="4" style="text-align:center;color:var(--muted)">No payments recorded</td></tr>')+'</tbody></table></div>'+
+  '<div class="mft"><button class="btn btn-p" onclick="S.modal=\'campaignPayments\';render()">Back</button></div></div>';
+}
+function saveCampPayment(id){
+  var p=DB.campaignPayments.find(function(x){return x.id===id});
+  if(!p||!isDirectCampPay(p))return;
+  if(!checkEditPassword('edit this contribution payment'))return;
+  var c=DB.campaigns.find(function(x){return x.id===p.campaignId});
+  var amt=parseInt(document.getElementById('cpa_'+id).value)||0;
+  var date=document.getElementById('cpd_'+id).value;
+  var method=document.getElementById('cpm_'+id).value;
+  if(amt<=0){toast('Enter a valid amount');return}
+  if(!date){toast('Date required');return}
+  var others=DB.campaignPayments.filter(function(q){return q.campaignId===p.campaignId&&q.memberId===p.memberId&&q.id!==id}).reduce(function(t,q){return t+q.amount},0);
+  if(c&&others+amt>c.amount){toast('Total paid cannot be more than '+kes(c.amount)+' -- the most you can enter here is '+kes(Math.max(0,c.amount-others)));return}
+  p.amount=amt;p.date=date;p.method=method;
+  resyncCampaignDeduction(p.campaignId,p.memberId);
+  save();toast('Payment updated');render();
+}
+function deleteCampPayment(id){
+  var p=DB.campaignPayments.find(function(x){return x.id===id});
+  if(!p||!isDirectCampPay(p))return;
+  if(!checkEditPassword('delete this contribution payment'))return;
+  if(!confirm('Delete this '+kes(p.amount)+' payment?'))return;
+  DB.campaignPayments=DB.campaignPayments.filter(function(x){return x.id!==id});
+  resyncCampaignDeduction(p.campaignId,p.memberId);
+  save();toast('Payment deleted');render();
 }
 
 function addCampaignMemberDeduction(cid,mid){

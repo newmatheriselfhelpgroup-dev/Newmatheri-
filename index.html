@@ -994,6 +994,77 @@ function findDuplicatePaymentRef(ref,excludeId){
     return p.ref&&p.ref.trim().toLowerCase()===ref;
   })||null;
 }
+// Looser check used at entry time (recordPayment, bulk uploads) — same member,
+// same month, same amount already recorded, regardless of method/date/ref. This
+// catches accidental double-entry of a cash payment, which has no reference
+// number to fall back on.
+function findDuplicatePaymentGeneral(memberId,amount,month,excludeId){
+  if(!memberId||!amount||!month)return null;
+  return DB.payments.find(function(p){
+    if(excludeId&&p.id===excludeId)return false;
+    return p.memberId===memberId&&p.amount===amount&&(p.month||'').trim().toLowerCase()===(month||'').trim().toLowerCase();
+  })||null;
+}
+// Strict grouping used by the admin "Find Duplicate Contributions" tool — same
+// member, month, amount, date, method AND reference. This level of agreement is
+// essentially only possible if the exact same transaction was recorded twice
+// (e.g. the same bulk file uploaded twice), so it's safe to group automatically.
+function findDuplicatePaymentGroups(){
+  var map={};
+  DB.payments.forEach(function(p){
+    var key=[p.memberId,(p.month||'').trim().toLowerCase(),p.amount,p.date,p.method,(p.ref||'').trim().toLowerCase()].join('|');
+    (map[key]=map[key]||[]).push(p);
+  });
+  return Object.keys(map).map(function(k){return map[k]}).filter(function(g){return g.length>1});
+}
+// Removes one payment record and reverses any deduction/campaign balance it had
+// contributed toward, using the payment's own deductionItems (recorded at the
+// time it was applied) so only exactly what this payment contributed is undone.
+function removePaymentWithReversal(paymentId){
+  var p=DB.payments.find(function(x){return x.id===paymentId});
+  if(!p)return;
+  (p.deductionItems||[]).forEach(function(item){
+    var d=DB.deductions.find(function(x){return x.id===item.deductionId});
+    if(d){d.paid=Math.max(0,(d.paid||0)-item.amount);if(d.paid<d.amount)d.status='Outstanding';}
+    if(item.campaignId){
+      var idx=DB.campaignPayments.findIndex(function(c){return c.campaignId===item.campaignId&&c.memberId===p.memberId&&c.amount===item.amount&&c.viaDeduction&&c.date===p.date;});
+      if(idx>-1)DB.campaignPayments.splice(idx,1);
+    }else{
+      var idx2=(DB.deductionPayments||[]).findIndex(function(dp){return dp.deductionId===item.deductionId&&dp.memberId===p.memberId&&dp.amount===item.amount&&dp.date===p.date;});
+      if(idx2>-1)DB.deductionPayments.splice(idx2,1);
+    }
+  });
+  DB.payments=DB.payments.filter(function(x){return x.id!==paymentId});
+}
+function doRemoveDuplicatePayments(keepId,removeIdsCsv){
+  if(!checkEditPassword('remove these duplicate contributions'))return;
+  var removeIds=removeIdsCsv.split(',').map(function(x){return parseInt(x)}).filter(function(id){return id!==parseInt(keepId)});
+  if(!confirm('Remove '+removeIds.length+' duplicate contribution(s)? This cannot be undone.'))return;
+  removeIds.forEach(removePaymentWithReversal);
+  save();toast('Duplicate contribution(s) removed');render();
+}
+function renderDuplicatePaymentsModal(){
+  var groups=findDuplicatePaymentGroups();
+  if(!groups.length){
+    return'<div class="mbox" style="max-width:480px"><div class="mhd"><h3>Find Duplicate Contributions</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div><div style="padding:20px;text-align:center;color:var(--muted)">✅ No duplicate contributions found — matched by member, month, amount, date, method and reference all being identical.</div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
+  }
+  var totalExtra=groups.reduce(function(s,g){return s+g.length-1},0);
+  var body=groups.map(function(g,gi){
+    var sorted=g.slice().sort(function(a,b){return a.id-b.id});
+    var idsCsv=sorted.map(function(p){return p.id}).join(',');
+    var m=DB.members.find(function(x){return x.id===sorted[0].memberId});
+    var rows=sorted.map(function(p,i){
+      return'<label style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;cursor:pointer;background:'+(i===0?'#F5FAF5':'#fff')+'"><input type="radio" name="keeppay_'+gi+'" value="'+p.id+'" '+(i===0?'checked':'')+' style="margin-top:3px"><div style="font-size:.74rem">'+kes(p.amount)+' — '+esc(p.month)+' &nbsp;|&nbsp; '+esc(p.date)+' &nbsp;|&nbsp; '+esc(p.method)+(p.ref?' &nbsp;|&nbsp; Ref: '+esc(p.ref):'')+(p.deducted>0?'<br><span style="color:var(--amber)">Includes '+kes(p.deducted)+' applied to a deduction</span>':'')+'</div></label>';
+    }).join('');
+    return'<div style="border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px"><p style="font-size:.76rem;margin-bottom:6px"><b>'+esc(m?m.name:'Unknown member')+'</b> — '+sorted.length+' identical entries</p>'+
+    '<p style="font-size:.72rem;color:var(--muted);margin-bottom:8px">Choose which one to <b>keep</b> — the others are removed (any deduction balance they affected is reversed).</p>'+rows+
+    '<button class="btn btn-sm btn-d" style="margin-top:4px" onclick="var sel=document.querySelector(\'input[name=keeppay_'+gi+']:checked\');doRemoveDuplicatePayments(sel?sel.value:'+sorted[0].id+',\''+idsCsv+'\')">Remove duplicates</button></div>';
+  }).join('');
+  return'<div class="mbox" style="max-width:640px"><div class="mhd"><h3>Find Duplicate Contributions</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div>'+
+  '<p style="font-size:.74rem;color:var(--muted);margin:0 0 10px">Found '+groups.length+' group(s) covering '+totalExtra+' extra duplicate contribution(s) — same member, month, amount, date, method and reference.</p>'+
+  '<div style="max-height:60vh;overflow:auto">'+body+'</div>'+
+  '<div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
+}
 function normNameForDup(s){return(s||'').trim().toLowerCase().replace(/\s+/g,' ')}
 function normPhoneForDup(s){return(s||'').replace(/[^0-9]/g,'').replace(/^0+/,'').slice(-9)}
 // Clusters members who look like the same person entered more than once — same
@@ -2318,6 +2389,58 @@ function formatDateLong(dateStr){
 // This tries the normal print-window approach first, and if that fails,
 // falls back to downloading the printable page as an .html file the
 // person can open in a full browser and print/save as PDF from there.
+// ─── THERMAL RECEIPT PRINTING (80mm roll printers) ───
+// Builds a narrow, receipt-styled slip for a single payment and sends it to
+// window.print(). Any printer already installed on the device — including a
+// USB/Bluetooth thermal receipt printer with its own driver, which is how
+// virtually all 58mm/80mm receipt printers are set up on Windows/Android —
+// shows up as a normal choice in that print dialog, so no extra software is
+// needed beyond installing the printer once on the device.
+function receiptHTML(p,m){
+  var lines=[];
+  (p.deductionItems||[]).forEach(function(item){
+    lines.push('<div class="rline"><span>Deduction: '+esc(item.reason)+'</span><span>'+kes(item.amount)+'</span></div>');
+  });
+  if(p.net>0||!p.deductionItems||!p.deductionItems.length){
+    lines.push('<div class="rline"><span>'+esc(p.month)+' contribution</span><span>'+kes(p.net!=null?p.net:p.amount)+'</span></div>');
+  }
+  var bal=getMemberDeductionBal(p.memberId);
+  var now=new Date();
+  var timeStr=now.toLocaleTimeString();
+  return'<html><head><meta charset="utf-8"><title>Receipt #'+p.id+'</title><style>'+
+  '@page{size:80mm auto;margin:0}'+
+  'body{width:74mm;margin:0 auto;padding:6px 4px;font-family:\'Courier New\',monospace;font-size:12px;color:#000}'+
+  'h1{font-size:14px;text-align:center;margin:2px 0}'+
+  '.sub{text-align:center;font-size:10px;margin:1px 0}'+
+  'hr{border:none;border-top:1px dashed #000;margin:6px 0}'+
+  '.rline{display:flex;justify-content:space-between;margin:2px 0}'+
+  '.tot{display:flex;justify-content:space-between;margin:4px 0;font-weight:bold;font-size:13px}'+
+  '.center{text-align:center}'+
+  '.small{font-size:10px}'+
+  '</style></head><body>'+
+  '<h1>'+esc(DB.settings.groupName)+'</h1>'+
+  '<div class="sub">Paybill: '+esc(DB.settings.paybill||'-')+' &nbsp; Acc: '+esc(DB.settings.account||'-')+'</div>'+
+  '<hr>'+
+  '<div class="rline"><span>Receipt #</span><span>'+p.id+'</span></div>'+
+  '<div class="rline"><span>Date</span><span>'+esc(p.date)+' '+timeStr+'</span></div>'+
+  '<div class="rline"><span>Member</span><span>'+esc(m?m.name:'—')+'</span></div>'+
+  '<div class="rline"><span>Member No.</span><span>'+esc(m?m.no:'—')+'</span></div>'+
+  '<hr>'+
+  lines.join('')+
+  '<hr>'+
+  '<div class="tot"><span>Amount Paid</span><span>'+kes(p.amount)+'</span></div>'+
+  '<div class="rline small"><span>Method</span><span>'+esc(p.method)+(p.ref?' — '+esc(p.ref):'')+'</span></div>'+
+  (bal>0?'<div class="rline small"><span>Outstanding balance</span><span>'+kes(bal)+'</span></div>':'')+
+  '<hr>'+
+  '<div class="center small">Thank you — '+esc(DB.settings.groupName)+'<br>Unity &amp; Progress</div>'+
+  '</body></html>';
+}
+function printReceipt(paymentId){
+  var p=DB.payments.find(function(x){return x.id===paymentId});
+  if(!p){toast('Payment not found');return}
+  var m=DB.members.find(function(x){return x.id===p.memberId});
+  openPrintableDoc(receiptHTML(p,m),'receipt_'+p.id);
+}
 function openPrintableDoc(html,filenameBase){
   var w=null;
   try{w=window.open('','_blank')}catch(e){w=null}
@@ -3321,14 +3444,14 @@ function renderContributionsByDate(){
       '<span style="font-size:.72rem;color:var(--muted)">'+rows.length+' contribution'+(rows.length===1?'':'s')+' · '+kes(total)+'</span></div>'+
       (open?'<table><thead><tr><th>Member</th><th>Month</th><th>Amount</th><th>Method</th><th>Ref</th><th>Actions</th></tr></thead><tbody>'+rows.map(function(p){
         var m=DB.members.find(function(x){return x.id===p.memberId});
-        return'<tr><td>'+esc(m?m.name:'')+'</td><td>'+esc(p.month)+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td><td>'+esc(p.ref||'-')+'</td><td><button class="btn btn-sm btn-s" onclick="S.modal=\'editPayment\';S.editMemberId='+p.id+';render()">Edit</button> <button class="btn btn-sm btn-d" onclick="deletePayment('+p.id+')">Delete</button></td></tr>';
+        return'<tr><td>'+esc(m?m.name:'')+'</td><td>'+esc(p.month)+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td><td>'+esc(p.ref||'-')+'</td><td><button class="btn btn-sm btn-g" onclick="printReceipt('+p.id+')">🖨 Receipt</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'editPayment\';S.editMemberId='+p.id+';render()">Edit</button> <button class="btn btn-sm btn-d" onclick="deletePayment('+p.id+')">Delete</button></td></tr>';
       }).join('')+'</tbody></table>':'')+
       '</div>';
   }).join('')+'</div>';
 }
 function renderAdminContributions(){
   return'<div class="pnl"><div class="pnl-t"><h3>Bulk Monthly Contributions Upload</h3></div><div style="padding:14px"><p style="font-size:.74rem;color:var(--muted);margin-bottom:10px">Download the template — it lists every current member as a row with one column per month. Fill in the amount each member paid in each month (leave a cell blank if they did not pay that month), then upload the completed file. One member can have amounts across as many different months as needed in a single row, e.g. Samuel: Jan 100, Mar 200, Apr 100, Jun 200.</p><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><button class="btn btn-s" onclick="downloadMonthlyContribTemplate()">⬇ Download Template</button><label class="btn btn-p" style="margin:0">⬆ Upload Filled Template<input type="file" accept=".csv,.xlsx,.xls" onchange="handleMonthlyContribUpload(event)" style="display:none"></label></div><p style="font-size:.68rem;color:var(--muted);margin-top:8px">Members are matched by National ID first, then by exact name — make sure names/IDs in the file match the system exactly. Uploading again for the same member and month updates the existing amount instead of duplicating it.</p></div></div>'+
-  '<div class="pnl"><div class="pnl-t"><h3>Contributions List</h3><button class="btn btn-sm btn-p" onclick="S.modal=\'recordPayment\';render()">+ Record</button></div>'+renderContributionsByDate()+'</div>'+
+  '<div class="pnl"><div class="pnl-t"><h3>Contributions List</h3><div style="display:flex;gap:6px"><button class="btn btn-sm btn-d" onclick="S.modal=\'dupPayments\';render()">🧬 Find Duplicates</button><button class="btn btn-sm btn-p" onclick="S.modal=\'recordPayment\';render()">+ Record</button></div></div>'+renderContributionsByDate()+'</div>'+
   '<div class="pnl"><div class="pnl-t"><h3>Manage Other Contributions (Campaigns)</h3><button class="btn btn-sm btn-p" onclick="S.modal=\'otherContrib\';render()">+ Create</button></div><table><thead><tr><th>Title</th><th>Amount</th><th>Due</th><th>Status</th><th>Actions</th></tr></thead><tbody>'+DB.campaigns.map(function(c){
     return'<tr><td><b>'+esc(c.title)+'</b></td><td>'+kes(c.amount)+'</td><td>'+c.dueDate+'</td><td><span class="pill '+(c.status==='Closed'?'pill-g':'pill-a')+'">'+c.status+'</span></td><td><button class="btn btn-sm btn-g" onclick="viewCampaignDetail('+c.id+')">Payments</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'editCampaign\';S.editMemberId='+c.id+';render()">Edit</button> <button class="btn btn-sm btn-d" onclick="deleteCampaign('+c.id+')">Delete</button>'+(c.status==='Open'?' <button class="btn btn-sm btn-g" onclick="closeCampaign('+c.id+')">Close</button>':'')+'</td></tr>';
   }).join('')+'</tbody></table></div>';
@@ -3759,6 +3882,7 @@ function renderModal(){
     case'sessionView':h=renderSessionModal(S.sessionFocusId);break;
     case'namesList':h=renderNamesListModal();break;
     case'dupMembers':h=renderDuplicateMembersModal();break;
+    case'dupPayments':h=renderDuplicatePaymentsModal();break;
     case'dependents':h=renderDependentsModal();break;
     case'addUser':h=renderAddUserModal();break;
     case'editUser':h=renderEditUserModal();break;
@@ -4180,6 +4304,8 @@ function recordPayment(){
   if(method!=='Cash'&&!ref){toast((method==='M-Pesa'?'The M-Pesa confirmation message/code':'The bank reference number')+' is required for '+method+' payments');return}
   var dupRef=findDuplicatePaymentRef(ref);
   if(dupRef){var dm=DB.members.find(function(x){return x.id===dupRef.memberId});toast('This reference/confirmation code has already been recorded — for '+(dm?dm.name:'a member')+' on '+dupRef.date+'. Duplicate payments are not allowed.');return}
+  var dupGen=findDuplicatePaymentGeneral(mid,amount,month);
+  if(dupGen&&!confirm(m.name+' already has a payment of '+kes(amount)+' recorded for '+month+' (on '+dupGen.date+'). Record this one anyway?'))return;
   if(!autoDeductEnabled()&&!memberCanPayMonthly(mid)){toast(m.name+' has outstanding deductions of '+kes(getMemberDeductionBal(mid))+'. Clear deductions first.');return}
   var pay={id:nid('p'),memberId:mid,amount:amount,date:date||getToday(),method:method,ref:ref,month:month};
   var activeSes=getActiveSession();if(activeSes)pay.sessionId=activeSes.id;
@@ -4188,6 +4314,7 @@ function recordPayment(){
   save();S.modal=null;
   toast(ded>0?'Payment recorded — '+kes(ded)+' deducted to clear outstanding amounts, '+kes(pay.amount)+' to monthly contribution':'Payment recorded');
   render();
+  if(confirm('Payment recorded. Print a receipt now?'))printReceipt(pay.id);
   sendPaymentConfirmationSMS(m,amount,month);
 }
 

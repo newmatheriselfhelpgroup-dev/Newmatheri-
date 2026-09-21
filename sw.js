@@ -1,6 +1,6 @@
 // Bump this version string every time you upload a new copy of New_Matheri_Sys.html
 // so returning devices pick up the update instead of an old cached copy.
-const CACHE_VERSION = 'matheri-shg-v6';
+const CACHE_VERSION = 'matheri-shg-v8';
 
 const APP_SHELL = [
   './index.html',

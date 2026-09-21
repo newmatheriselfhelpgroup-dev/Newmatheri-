@@ -195,28 +195,117 @@ function sanitizeForCloud(db){
   return JSON.parse(JSON.stringify(db));
 }
 var MERGE_ARRAY_KEYS=['members','payments','campaigns','campaignPayments','deductions','deductionPayments','expenses','sessions','smsLog','bankDeposits','assets','assetIncome','dependents','users'];
-function mergeArraysById(oldArr,newArr){
-  oldArr=oldArr||[];newArr=newArr||[];
+// ── CHANGE TRACKING: record stamps + deletion tombstones ──────────────────────────────────
+// The cloud copy and each device's copy are merged record-by-record (see mergeCloudIntoLocal).
+// For that to give the right answer, every record needs to say WHEN it last changed (_u), and
+// every record that gets deleted has to leave a note behind (a "tombstone" in DB.tomb) --
+// otherwise the merge cannot tell "deleted on this device" from "not downloaded yet" and the
+// deleted record is simply copied back from the cloud. save() compares the data with what it
+// looked like at the last save/sync, so every edit and delete in the app is picked up
+// automatically without each delete/edit button having to know about it.
+var SYNC_KEYS=MERGE_ARRAY_KEYS.concat(['documents.minutes','documents.letters']);
+function syncArr(db,k){
+  if(k.indexOf('documents.')===0)return(db.documents&&db.documents[k.slice(10)])||[];
+  return db[k]||[];
+}
+// Single-value fields (each setting, the notice board, constitution, rules) are stamped one by one.
+function syncSingles(db){
+  var o={};
+  Object.keys(db.settings||{}).forEach(function(k){o['settings.'+k]=db.settings[k]});
+  o.notice=db.notice;
+  if(db.documents){o['documents.constitution']=db.documents.constitution;o['documents.rules']=db.documents.rules}
+  return o;
+}
+function setSingle(db,k,v){
+  if(k.indexOf('settings.')===0){db.settings=db.settings||{};db.settings[k.slice(9)]=v}
+  else if(k.indexOf('documents.')===0){db.documents=db.documents||{};db.documents[k.slice(10)]=v}
+  else db[k]=v;
+}
+function recSig(it){return JSON.stringify(it,function(k,v){return k==='_u'?undefined:v})}
+var SYNC_BASE=null;
+function snapshotForSync(db){
+  var o={arr:{},one:{}};
+  SYNC_KEYS.forEach(function(k){var m={};syncArr(db,k).forEach(function(it){if(it&&it.id!=null)m[it.id]=recSig(it)});o.arr[k]=m});
+  var f=syncSingles(db);Object.keys(f).forEach(function(k){o.one[k]=JSON.stringify(f[k])});
+  return o;
+}
+// Call whenever DB is replaced as a whole (cloud merge, backup restore): what is in it now is the new "before".
+function resetSyncBaseline(){SYNC_BASE=snapshotForSync(DB)}
+function trackChanges(){
+  if(!SYNC_BASE){resetSyncBaseline();return}
+  var now=Date.now();
+  DB.tomb=DB.tomb||{};DB._su=DB._su||{};
+  SYNC_KEYS.forEach(function(k){
+    var base=SYNC_BASE.arr[k]||{},cur={};
+    syncArr(DB,k).forEach(function(it){
+      if(!it||it.id==null)return;
+      var sg=recSig(it);cur[it.id]=sg;
+      if(base[it.id]!==sg)it._u=now; // new or edited since the last save
+    });
+    Object.keys(base).forEach(function(id){
+      if(!(id in cur)){(DB.tomb[k]=DB.tomb[k]||{})[id]=now} // removed since the last save
+    });
+    SYNC_BASE.arr[k]=cur;
+  });
+  var f=syncSingles(DB);
+  Object.keys(f).forEach(function(k){
+    var sg=JSON.stringify(f[k]);
+    if(SYNC_BASE.one[k]!==sg){DB._su[k]=now;SYNC_BASE.one[k]=sg}
+  });
+}
+function mergeTombs(a,b){
+  var out={};
+  [a,b].forEach(function(t){
+    Object.keys(t||{}).forEach(function(k){
+      var src=t[k]||{},dst=out[k]=out[k]||{};
+      Object.keys(src).forEach(function(id){if(!(id in dst)||src[id]>dst[id])dst[id]=src[id]});
+    });
+  });
+  return out;
+}
+function mergeArraysById(oldArr,newArr,tomb){
+  oldArr=oldArr||[];newArr=newArr||[];tomb=tomb||{};
   var map={},order=[];
   oldArr.forEach(function(item){if(item&&item.id!=null){if(!(item.id in map))order.push(item.id);map[item.id]=item;}});
-  newArr.forEach(function(item){if(item&&item.id!=null){if(!(item.id in map))order.push(item.id);map[item.id]=item;}});
-  return order.sort(function(a,b){return a-b}).map(function(k){return map[k]});
+  newArr.forEach(function(item){
+    if(!item||item.id==null)return;
+    if(item.id in map){
+      // Same record on both sides: whichever copy was changed most recently wins.
+      // A tie (or records with no stamp yet) keeps the cloud copy, as before.
+      if((map[item.id]._u||0)>(item._u||0))return;
+    }else order.push(item.id);
+    map[item.id]=item;
+  });
+  return order
+    .filter(function(id){var t=tomb[id];return t===undefined||t<(map[id]._u||0)}) // deleted (and not changed since) -> stays deleted
+    .sort(function(a,b){return a-b}).map(function(k){return map[k]});
 }
 // Combines two copies of the whole database (the one on this device and the one just
-// pulled from the cloud) instead of one blindly overwriting the other. This matters
-// whenever more than one device can be recording payments/deductions/sessions at once —
-// e.g. one collector offline for a while, another online — so nobody's records vanish
-// when the two finally sync up. Records that exist on only one side are kept; where the
-// same record id exists on both sides, the cloud's copy is treated as the settled one.
+// pulled from the cloud) instead of one blindly overwriting the other, so nobody's records
+// vanish when devices sync -- e.g. one collector offline for a while, another online.
+// Records that exist on only one side are kept UNLESS a tombstone says they were deleted;
+// where the same record exists on both sides the most recently changed copy wins.
 function mergeCloudIntoLocal(oldDB,newDB){
   if(!oldDB)return newDB;
   if(!newDB)return oldDB;
   var merged=JSON.parse(JSON.stringify(newDB));
-  MERGE_ARRAY_KEYS.forEach(function(key){merged[key]=mergeArraysById(oldDB[key],newDB[key]);});
+  var tomb=mergeTombs(oldDB.tomb,newDB.tomb);
+  merged.tomb=tomb;
+  MERGE_ARRAY_KEYS.forEach(function(key){merged[key]=mergeArraysById(oldDB[key],newDB[key],tomb[key]);});
   merged.documents=merged.documents||{constitution:'',rules:'',minutes:[],letters:[]};
-  merged.documents.minutes=mergeArraysById(oldDB.documents&&oldDB.documents.minutes,newDB.documents&&newDB.documents.minutes);
-  merged.documents.letters=mergeArraysById(oldDB.documents&&oldDB.documents.letters,newDB.documents&&newDB.documents.letters);
-  // Never let a synced id counter go backwards — otherwise a device that hasn't
+  merged.documents.minutes=mergeArraysById(oldDB.documents&&oldDB.documents.minutes,newDB.documents&&newDB.documents.minutes,tomb['documents.minutes']);
+  merged.documents.letters=mergeArraysById(oldDB.documents&&oldDB.documents.letters,newDB.documents&&newDB.documents.letters,tomb['documents.letters']);
+  // Single-value fields (settings, notice, constitution, rules): newest change wins, field by field.
+  var o=syncSingles(oldDB),n=syncSingles(newDB),ou=oldDB._su||{},nu=newDB._su||{},su={},keys={};
+  Object.keys(o).concat(Object.keys(n)).forEach(function(k){keys[k]=1});
+  Object.keys(keys).forEach(function(k){
+    var inO=(k in o),inN=(k in n);
+    var local=inO&&(!inN||(ou[k]||0)>(nu[k]||0));
+    setSingle(merged,k,local?o[k]:n[k]);
+    var t=local?ou[k]:nu[k];if(t)su[k]=t;
+  });
+  merged._su=su;
+  // Never let a synced id counter go backwards -- otherwise a device that hasn't
   // caught up yet could hand out an id that's already in use.
   merged.nid=merged.nid||{};
   var oldNid=oldDB.nid||{};
@@ -227,9 +316,14 @@ function mergeCloudIntoLocal(oldDB,newDB){
   (merged.members||[]).forEach(function(m){var old=oldMembersById[m.id];if(old&&old.customPassword&&!m.customPassword)m.customPassword=old.customPassword;});
   return merged;
 }
+function applyCloudMerge(cloudData){
+  DB=mergeCloudIntoLocal(DB,cloudData);
+  resetSyncBaseline();
+}
 function pushToCloud(){
   if(cloudSyncTimer)clearTimeout(cloudSyncTimer);
   cloudSyncTimer=setTimeout(function(){
+    try{trackChanges()}catch(e){}
     if(!SESSION_U){return} // not logged in — nothing to authenticate the write with
     if(navigator.onLine===false){
       pendingSync=true;
@@ -245,7 +339,7 @@ function pushToCloud(){
     }).then(function(r){return r.json()}).catch(function(){return null})
       .then(function(result){
         if(result&&result.data&&result.updated_at!==lastCloudUpdatedAt){
-          DB=mergeCloudIntoLocal(DB,result.data);
+          applyCloudMerge(result.data);
           localStorage.setItem(V,JSON.stringify(DB));
           if(!S.modal)render();
         }
@@ -337,7 +431,7 @@ function pullFromCloud(cb){
       if(result&&result.data){
         if(result.updated_at!==lastCloudUpdatedAt){
           lastCloudUpdatedAt=result.updated_at;
-          DB=mergeCloudIntoLocal(DB,result.data);
+          applyCloudMerge(result.data);
           localStorage.setItem(V,JSON.stringify(DB));
           if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
           if(cb)cb(true);
@@ -352,7 +446,7 @@ function pullFromCloud(cb){
     })
     .catch(function(e){console.warn('Cloud pull failed:',e);if(typeof syncState!=='undefined'){syncState='error';refreshSyncBtn()}if(cb)cb(false)});
 }
-function save(){localStorage.setItem(V,JSON.stringify(DB));pushToCloud()}
+function save(){try{trackChanges()}catch(e){console.warn('Change tracking failed:',e)}localStorage.setItem(V,JSON.stringify(DB));pushToCloud()}
 
 // ─── TAP-TO-SEND SMS (opens phone's Messages app, pre-filled) ───
 function normalizePhoneForSms(phone){
@@ -407,7 +501,7 @@ function manualSync(){
     .then(function(result){
       if(result&&result.data){
         lastCloudUpdatedAt=result.updated_at;
-        DB=mergeCloudIntoLocal(DB,result.data);
+        applyCloudMerge(result.data);
         localStorage.setItem(V,JSON.stringify(DB));
         syncState='synced';
         toast('Updated with latest shared data');
@@ -696,7 +790,7 @@ function renderSessionModal(id){
   return'<div class="mbox" style="max-width:760px"><div class="mhd"><h3>Session — '+formatDateLong(ses.date)+' ('+ses.startedAt+(ses.status==='active'?', ongoing':' – '+ses.closedAt)+')</h3><div style="display:flex;gap:6px">'+(allRows.length?'<button class="btn btn-sm btn-s" onclick="downloadSessionA4('+ses.id+')">🖨 A4</button>':'')+'<button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div></div>'+
   '<p style="font-size:.72rem;color:var(--muted);margin-bottom:0">Opened by '+esc(ses.startedBy)+(ses.status==='closed'?' &nbsp;·&nbsp; Closed by '+esc(ses.closedBy):' &nbsp;·&nbsp; <span class="pill pill-g">Still open</span>')+' &nbsp;|&nbsp; '+allRows.length+' contribution(s) recorded</p>'+
   statsBar+filterBar+
-  '<div style="max-height:52vh;overflow:auto"><table><thead><tr><th>Member</th><th>Month Covered</th><th>Paid In</th><th>Deducted</th><th>To Contribution</th><th>Method</th></tr></thead><tbody>'+
+  '<div style="max-height:52vh;overflow:auto"><table><thead><tr><th>Member</th><th>Month Covered</th><th>Paid In</th><th>Deducted</th><th>To Contribution</th><th>Method</th>'+(canManageSessions()?'<th></th>':'')+'</tr></thead><tbody>'+
   (rows.length?rows.map(function(r){
     var lines=[];
     if(r.deducted>0){
@@ -705,8 +799,8 @@ function renderSessionModal(id){
     if(r.net>0){lines.push('↪ '+kes(r.net)+' covered '+esc(r.month))}
     else if(r.deducted>0){lines.push('↪ '+esc(r.month)+' not yet covered — full payment went to the deduction above')}
     var note=lines.length?'<div style="font-size:.66rem;color:var(--muted);margin-top:2px">'+lines.join('<br>')+'</div>':'';
-    return'<tr><td>'+esc(r.m.name)+note+'</td><td>'+esc(r.month)+'</td><td>'+kes(r.gross)+'</td><td style="color:'+(r.deducted>0?'var(--amber)':'var(--muted)')+'">'+(r.deducted>0?'-'+kes(r.deducted):'—')+'</td><td style="font-weight:700;color:var(--green)">'+kes(r.net)+'</td><td>'+esc(r.method)+'</td></tr>';
-  }).join(''):'<tr><td colspan="6" style="text-align:center;color:var(--muted)">No contributions match this filter.</td></tr>')+
+    return'<tr><td>'+esc(r.m.name)+note+'</td><td>'+esc(r.month)+'</td><td>'+kes(r.gross)+'</td><td style="color:'+(r.deducted>0?'var(--amber)':'var(--muted)')+'">'+(r.deducted>0?'-'+kes(r.deducted):'—')+'</td><td style="font-weight:700;color:var(--green)">'+kes(r.net)+'</td><td>'+esc(r.method)+'</td>'+(canManageSessions()?'<td style="white-space:nowrap"><button class="btn btn-sm btn-s" onclick="editSessionPayment('+r.p.id+')">Edit</button> <button class="btn btn-sm btn-d" onclick="deletePayment('+r.p.id+')">Delete</button></td>':'')+'</tr>';
+  }).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--muted)">No contributions match this filter.</td></tr>')+
   '</tbody></table></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
 }
 
@@ -1047,20 +1141,26 @@ function findDuplicatePaymentGroups(){
 // Removes one payment record and reverses any deduction/campaign balance it had
 // contributed toward, using the payment's own deductionItems (recorded at the
 // time it was applied) so only exactly what this payment contributed is undone.
-function removePaymentWithReversal(paymentId){
-  var p=DB.payments.find(function(x){return x.id===paymentId});
-  if(!p)return;
+function reversePaymentDeductions(p){
   (p.deductionItems||[]).forEach(function(item){
     var d=DB.deductions.find(function(x){return x.id===item.deductionId});
     if(d){d.paid=Math.max(0,(d.paid||0)-item.amount);if(d.paid<d.amount)d.status='Outstanding';}
-    if(item.campaignId){
-      var idx=DB.campaignPayments.findIndex(function(c){return c.campaignId===item.campaignId&&c.memberId===p.memberId&&c.amount===item.amount&&c.viaDeduction&&c.date===p.date;});
-      if(idx>-1)DB.campaignPayments.splice(idx,1);
-    }else{
-      var idx2=(DB.deductionPayments||[]).findIndex(function(dp){return dp.deductionId===item.deductionId&&dp.memberId===p.memberId&&dp.amount===item.amount&&dp.date===p.date;});
-      if(idx2>-1)DB.deductionPayments.splice(idx2,1);
-    }
+    var arr=item.campaignId?DB.campaignPayments:(DB.deductionPayments||[]);
+    var match=function(c,withDate){
+      return c.viaDeduction&&c.memberId===p.memberId&&c.amount===item.amount&&
+        (item.campaignId?c.campaignId===item.campaignId:c.deductionId===item.deductionId)&&
+        (!withDate||c.date===p.date);
+    };
+    var idx=arr.findIndex(function(c){return match(c,true)});
+    if(idx<0)idx=arr.findIndex(function(c){return match(c,false)});
+    if(idx>-1)arr.splice(idx,1);
   });
+  p.deductionItems=[];p.deducted=0;
+}
+function removePaymentWithReversal(paymentId){
+  var p=DB.payments.find(function(x){return x.id===paymentId});
+  if(!p)return;
+  reversePaymentDeductions(p);
   DB.payments=DB.payments.filter(function(x){return x.id!==paymentId});
 }
 function doRemoveDuplicatePayments(keepId,removeIdsCsv){
@@ -3486,7 +3586,7 @@ function renderContributionsByDate(){
       '<span style="font-size:.72rem;color:var(--muted)">'+rows.length+' contribution'+(rows.length===1?'':'s')+' · '+kes(total)+'</span></div>'+
       (open?'<table><thead><tr><th>Member</th><th>Month</th><th>Amount</th><th>Method</th><th>Ref</th><th>Actions</th></tr></thead><tbody>'+rows.map(function(p){
         var m=DB.members.find(function(x){return x.id===p.memberId});
-        return'<tr><td>'+esc(m?m.name:'')+'</td><td>'+esc(p.month)+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td><td>'+esc(p.ref||'-')+'</td><td><button class="btn btn-sm btn-g" onclick="printReceipt('+p.id+')">🖨 Receipt</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'editPayment\';S.editMemberId='+p.id+';render()">Edit</button> <button class="btn btn-sm btn-d" onclick="deletePayment('+p.id+')">Delete</button></td></tr>';
+        return'<tr><td>'+esc(m?m.name:'')+'</td><td>'+esc(p.month)+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method)+'</td><td>'+esc(p.ref||'-')+'</td><td><button class="btn btn-sm btn-g" onclick="printReceipt('+p.id+')">🖨 Receipt</button> <button class="btn btn-sm btn-s" onclick="S.modal=\'editPayment\';S.editPaymentBack=null;S.editMemberId='+p.id+';render()">Edit</button> <button class="btn btn-sm btn-d" onclick="deletePayment('+p.id+')">Delete</button></td></tr>';
       }).join('')+'</tbody></table>':'')+
       '</div>';
   }).join('')+'</div>';
@@ -3877,7 +3977,7 @@ function restoreBackup(input){
         return;
       }
       downloadBackup(); // automatic safety snapshot of current data before overwriting
-      DB=incoming;
+      DB=incoming;resetSyncBaseline();
       save();
       toast('Backup restored successfully — a safety copy of your previous data was also downloaded');
       input.value='';
@@ -4042,32 +4142,52 @@ function renderRecordPaymentModal(){
 function renderEditPaymentModal(){
   var p=DB.payments.find(function(x){return x.id===S.editMemberId});
   if(!p)return'<div class="mbox"><p>Not found</p></div>';
-  return'<div class="mbox"><div class="mhd"><h3>Edit Payment</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div><div class="fg">'+
+  var gross=paymentGross(p),ded=p.deducted||0;
+  var split=ded>0?'<div style="grid-column:1/-1;font-size:.72rem;color:var(--muted);background:var(--bg2);border-radius:8px;padding:8px 10px">Currently: '+kes(gross)+' paid in &mdash; '+kes(ded)+' cleared outstanding amounts ('+(p.deductionItems||[]).map(function(it){return esc(it.reason||'deduction')}).join(', ')+'), '+kes(p.amount)+' counted as monthly contribution.</div>':'';
+  var sesOpts='<option value="">No session</option>'+sessionsList().map(function(x){return'<option value="'+x.id+'"'+(p.sessionId===x.id?' selected':'')+'>'+formatDateLong(x.date)+(x.status==='active'?' (open)':'')+'</option>'}).join('');
+  var recalc=autoDeductEnabled()?'<label style="grid-column:1/-1;display:flex;gap:8px;align-items:flex-start;font-size:.74rem;cursor:pointer"><input type="checkbox" id="epRecalc" style="width:auto;margin-top:2px"'+(ded>0?' checked':'')+'><span>Use this payment to clear the member\'s outstanding deductions / other contributions first (oldest first). Anything this payment cleared before is reversed and worked out again from the new details.</span></label>':'';
+  return'<div class="mbox"><div class="mhd"><h3>Edit Payment</h3><button class="btn btn-sm btn-s" onclick="closeEditPayment()">&#10005;</button></div><div class="fg">'+
   '<div class="field" style="grid-column:1/-1"><label>Member</label><select id="epMem">'+sortByName(DB.members).map(function(m){return'<option value="'+m.id+'"'+(p.memberId===m.id?' selected':'')+'>'+esc(m.name)+' ('+m.no+')</option>'}).join('')+'</select></div>'+
-  '<div class="field"><label>Amount (KES)</label><input id="epAmt" type="number" value="'+p.amount+'"></div>'+
+  '<div class="field"><label>Amount Paid In (KES)</label><input id="epAmt" type="number" value="'+gross+'"></div>'+
   '<div class="field"><label>Method</label><select id="epMet"><option'+(p.method==='Cash'?' selected':'')+'>Cash</option><option'+(p.method==='M-Pesa'?' selected':'')+'>M-Pesa</option><option'+(p.method==='Bank Transfer'?' selected':'')+'>Bank Transfer</option></select></div>'+
   '<div class="field" style="grid-column:1/-1"><label>Reference</label><input id="epRef" value="'+esc(p.ref||'')+'"></div>'+
   '<div class="field"><label>Month</label><input id="epMon" value="'+esc(p.month)+'"></div>'+
   '<div class="field"><label>Date</label><input id="epDat" type="date" value="'+p.date+'"></div>'+
-  '</div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Cancel</button><button class="btn btn-p" onclick="savePaymentEdit('+p.id+')">Save Changes</button></div></div>';
+  '<div class="field" style="grid-column:1/-1"><label>Collection Session</label><select id="epSes">'+sesOpts+'</select></div>'+
+  split+recalc+
+  '</div><div class="mft"><button class="btn btn-d" style="margin-right:auto" onclick="deletePayment('+p.id+')">Delete</button><button class="btn btn-s" onclick="closeEditPayment()">Cancel</button><button class="btn btn-p" onclick="savePaymentEdit('+p.id+')">Save Changes</button></div></div>';
 }
+// Opened from a collection session: edit any contribution recorded in it, then come back to the session.
+function editSessionPayment(id){S.modal='editPayment';S.editMemberId=id;S.editPaymentBack='sessionView';render()}
+function closeEditPayment(){var back=S.editPaymentBack;S.editPaymentBack=null;S.modal=back||null;render()}
 function savePaymentEdit(id){
   if(!checkEditPassword('edit this payment'))return;
   var p=DB.payments.find(function(x){return x.id===id});if(!p)return;
   var mid=parseInt(document.getElementById('epMem').value);
   var m=DB.members.find(function(x){return x.id===mid});
   if(!m){toast('Member not found');return}
-  var amount=parseInt(document.getElementById('epAmt').value)||0;
-  if(!amount){toast('Amount required');return}
+  var gross=parseInt(document.getElementById('epAmt').value)||0;
+  if(!gross){toast('Amount required');return}
   var method=document.getElementById('epMet').value;
   var ref=document.getElementById('epRef').value.trim();
   var month=document.getElementById('epMon').value.trim();
   var date=document.getElementById('epDat').value;
+  var sesVal=document.getElementById('epSes').value;
+  var recalcEl=document.getElementById('epRecalc');
+  var recalc=recalcEl?recalcEl.checked:false;
   if(method!=='Cash'&&!ref){toast((method==='M-Pesa'?'The M-Pesa confirmation message/code':'The bank reference number')+' is required for '+method+' payments');return}
   var dupRef=findDuplicatePaymentRef(ref,id);
-  if(dupRef){var dm=DB.members.find(function(x){return x.id===dupRef.memberId});toast('This reference/confirmation code has already been recorded — for '+(dm?dm.name:'a member')+' on '+dupRef.date+'. Duplicate payments are not allowed.');return}
-  p.memberId=mid;p.amount=amount;p.method=method;p.ref=ref;p.month=month||p.month;p.date=date||p.date;
-  save();S.modal=null;toast('Payment updated');render();
+  if(dupRef){var dm=DB.members.find(function(x){return x.id===dupRef.memberId});toast('This reference/confirmation code has already been recorded -- for '+(dm?dm.name:'a member')+' on '+dupRef.date+'. Duplicate payments are not allowed.');return}
+  // Undo whatever this payment previously cleared, apply the new details, then work the deduction out again.
+  reversePaymentDeductions(p);
+  p.memberId=mid;p.method=method;p.ref=ref;p.month=month||p.month;p.date=date||p.date;
+  if(sesVal)p.sessionId=parseInt(sesVal);else delete p.sessionId;
+  p.amount=gross;
+  if(recalc){applyAutoDeductions(p)}else{p.gross=gross;p.deducted=0;p.deductionItems=[]}
+  var back=S.editPaymentBack;S.editPaymentBack=null;S.modal=back||null;
+  save();
+  toast(p.deducted>0?'Payment updated -- '+kes(p.deducted)+' deducted to clear outstanding amounts, '+kes(p.amount)+' to monthly contribution':'Payment updated');
+  render();
 }
 function onPaymentMethodChange(){
   var met=document.getElementById('pMet').value,lbl=document.getElementById('pRefLabel'),ref=document.getElementById('pRef');
@@ -4361,9 +4481,12 @@ function recordPayment(){
 }
 
 function deletePayment(id){
+  var p=DB.payments.find(function(x){return x.id===id});if(!p)return;
   if(!checkEditPassword('delete this payment'))return;
-  if(!confirm('Delete this payment?'))return;
-  DB.payments=DB.payments.filter(function(p){return p.id!==id});
+  var ded=p.deducted||0;
+  if(!confirm('Delete this payment?'+(ded>0?' The '+kes(ded)+' it cleared from outstanding amounts will be put back as owing.':'')))return;
+  removePaymentWithReversal(id);
+  if(S.modal==='editPayment'){var back=S.editPaymentBack;S.editPaymentBack=null;S.modal=back||null}
   save();toast('Payment deleted');render();
 }
 

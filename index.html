@@ -38,7 +38,34 @@ table{width:100%;border-collapse:collapse}th{text-align:left;padding:7px 10px;fo
 .toast{position:fixed;right:14px;bottom:14px;background:var(--navy);color:#fff;padding:10px 16px;border-radius:var(--radius);font-size:.76rem;z-index:110;max-width:340px;animation:slideUp .3s ease}
 @keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
 .tag{display:inline-flex;align-items:center;gap:4px;background:var(--sky);border:1px solid var(--border);border-radius:99px;padding:3px 8px;font-size:.68rem;font-weight:700}.tag .x{cursor:pointer;opacity:.6}
-.login-page{min-height:100vh;display:flex;flex-direction:column;background-color:var(--navy);background-image:linear-gradient(rgba(31,56,100,.82),rgba(31,56,100,.88)),var(--bg-image);background-size:cover;background-position:center}.login-center{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:20px;width:100%;padding:20px 12px}.login-box{width:min(400px,90vw);background:var(--card);border-radius:16px;padding:32px 28px;box-shadow:0 20px 60px rgba(0,0,0,.3)}.login-logo{margin-bottom:20px;text-align:center}.login-logo h2{font-size:1.1rem;font-weight:800;margin-bottom:2px}.login-logo p{font-size:.72rem;color:var(--muted)}.login-err{background:var(--red-bg);color:var(--red);padding:8px 12px;border-radius:var(--radius);font-size:.78rem;margin-bottom:12px}.login-credit{text-align:center;color:#AFC4E8;font-size:.72rem;opacity:.9}.login-credit b{display:block;font-size:.82rem;font-weight:800;color:#fff;margin-bottom:2px}.login-page .copyright{color:#AFC4E8}.login-page .system-footer{border-top:1px solid rgba(255,255,255,.15);margin-top:0}
+.login-page{min-height:100vh;display:flex;flex-direction:column;background-color:var(--navy);background-image:linear-gradient(rgba(31,56,100,.82),rgba(31,56,100,.88)),var(--bg-image);background-size:cover;background-position:center}.login-center{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:20px;width:100%;padding:20px 12px}/* ── Login window (desktop-app style) ── */
+.login-win{width:min(500px,94vw);background:#fff;border:1px solid #6d8fc0;border-radius:4px;box-shadow:0 20px 60px rgba(0,0,0,.4);overflow:hidden}
+.lw-title{display:flex;align-items:center;gap:8px;padding:6px 10px;background:linear-gradient(#fff,#e6edf8);border-bottom:1px solid #b9c8e0;color:var(--blue);font-weight:800;font-size:.8rem;letter-spacing:.03em}
+.lw-title i{display:inline-block;width:14px;height:14px;border-radius:50%;background:radial-gradient(circle at 35% 35%,var(--gold),var(--navy) 72%)}
+.lw-banner{position:relative;height:150px;display:flex;align-items:center;justify-content:center;gap:16px;padding:0 16px 34px;background-color:#2f7d4f;background-image:linear-gradient(rgba(4,60,40,.38),rgba(4,60,40,.18)),var(--bg-image);background-size:cover;background-position:center 78%}
+.lw-banner::after{content:"";position:absolute;left:0;right:0;bottom:0;height:78px;background:linear-gradient(rgba(255,255,255,0),#fff)}
+.lw-badge{position:relative;z-index:1;flex:0 0 auto;display:block;width:76px;height:76px;border-radius:50%;overflow:hidden;background:#fff;box-shadow:0 0 0 3px #fff,0 4px 12px rgba(0,0,0,.4)}
+.lw-badge img{position:absolute;left:-38px;top:-21.7px;width:759px;max-width:none;height:auto}
+.lw-name{position:relative;z-index:1;color:#fff;font-weight:900;font-size:clamp(1.05rem,5vw,1.65rem);line-height:1.08;letter-spacing:.02em;text-transform:uppercase;text-shadow:0 2px 6px rgba(0,0,0,.6)}
+.lw-name small{display:block;margin-top:3px;color:var(--gold);font-size:.6em;font-weight:800;letter-spacing:.09em}
+.lw-head{text-align:center;padding:2px 20px 0}
+.lw-head h2{font-size:1.2rem;font-weight:500;letter-spacing:.04em;color:#111;text-transform:uppercase}
+.lw-head p{font-size:.72rem;color:var(--muted);margin-top:2px}
+.lw-form{padding:16px 34px 4px}
+.lw-form .login-err{margin:0 0 12px}
+.lw-row{display:grid;grid-template-columns:110px 1fr;align-items:center;gap:10px;margin-bottom:16px}
+.lw-row label{font-size:.95rem;color:#000}
+.lw-row input{width:100%;height:34px;padding:0 8px;background:#fff;border:1px solid #7f9db9;border-radius:0;font-size:.92rem;color:#000;outline:none}
+.lw-row input:focus{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
+.lw-row input:disabled{background:#f3f4f6;color:#888}
+.lw-btn{justify-self:start;min-width:130px;height:34px;padding:0 22px;background:linear-gradient(#fff,#eef3fa);border:1px solid #7f9db9;border-radius:2px;color:#1a3c6e;font-size:.95rem}
+.lw-btn:hover:not(:disabled){background:var(--sky);border-color:var(--blue)}
+.lw-btn:disabled{opacity:.6;cursor:default}
+.lw-foot{display:flex;align-items:center;gap:10px;padding:0 14px 8px}
+.lw-foot img{flex:0 0 auto;height:84px;width:auto;margin:-20px 0 -20px -8px}
+.lw-foot .lw-foot-fallback{display:none;font-weight:800;color:var(--navy);font-size:.78rem;letter-spacing:.04em}
+.login-page .lw-foot .copyright{flex:1;text-align:center;margin:0;font-size:.64rem;color:#444}
+@media(max-width:440px){.lw-form{padding:14px 20px 2px}.lw-row{grid-template-columns:1fr;gap:4px;margin-bottom:12px}.lw-btn{justify-self:stretch}.lw-banner{gap:12px}.lw-badge{width:64px;height:64px}.lw-badge img{left:-32px;top:-18.3px;width:640px}}.login-err{background:var(--red-bg);color:var(--red);padding:8px 12px;border-radius:var(--radius);font-size:.78rem;margin-bottom:12px}.login-credit{text-align:center;color:#AFC4E8;font-size:.72rem;opacity:.9}.login-credit b{display:block;font-size:.82rem;font-weight:800;color:#fff;margin-bottom:2px}.login-page .copyright{color:#AFC4E8}.login-page .system-footer{border-top:1px solid rgba(255,255,255,.15);margin-top:0}
 .system-footer{width:100%;padding:6px 10px;background:transparent;border-top:1px solid var(--border);margin-top:auto;flex-shrink:0}.blueprint-footer{width:100%;max-width:1400px;margin:auto;display:flex;justify-content:center;align-items:center}.blueprint-footer-image{display:block;width:auto;max-width:160px;max-height:34px;height:auto;object-fit:contain;transition:transform .3s ease}.blueprint-footer-image:hover{transform:scale(1.03)}.copyright{text-align:center;margin-top:2px;font-size:10px;color:#999}
 @media(max-width:768px){.system-footer{padding:5px 5px}.blueprint-footer-image{max-width:130px;max-height:28px}.copyright{font-size:9px}}
 @media(max-width:480px){.system-footer{padding:4px 3px}.blueprint-footer-image{max-width:110px;max-height:24px}.copyright{font-size:8px;margin-top:2px}}
@@ -1373,7 +1400,7 @@ function startCloudSyncIfNeeded(){
 }
 function render(){
   var app=document.getElementById('app');
-  if(!S.user){app.innerHTML=renderLogin();return}
+  if(!S.user){app.innerHTML=renderLogin();var _lu=document.getElementById('lu');if(_lu&&!_lu.disabled&&!('ontouchstart' in window))_lu.focus();return}
   startCloudSyncIfNeeded();
   try{
     processCampaignDueDeductions();
@@ -1451,7 +1478,22 @@ function processCampaignDueDeductions(){
 
 function renderLogin(){
   var loginNoticeHtml=isNoticeActive()?'<div class="notice-bar" style="justify-content:center"><span class="nb-icon">📢</span><span>'+esc(DB.notice.text)+'</span></div>':'';
-  return'<div class="login-page">'+loginNoticeHtml+'<div class="login-center"><div class="login-header"><img src="'+IMG_HEADER_FULL+'" alt="'+esc(DB.settings.groupName)+'"></div><div class="login-box"><div class="login-logo"><p>Unity &amp; Progress</p></div>'+(S.err?'<div class="login-err">'+esc(S.err)+'</div>':'')+'<div class="field"><label>Username</label><input id="lu" placeholder="Enter username"'+(S.loginBusy?' disabled':'')+'></div><div class="field"><label>Password</label><input id="lp" type="password" placeholder="Enter password"'+(S.loginBusy?' disabled':'')+'></div><button class="btn btn-p" style="width:100%;justify-content:center;margin-top:8px" onclick="doLogin()"'+(S.loginBusy?' disabled':'')+'>'+(S.loginBusy?'Signing in…':'Sign In')+'</button></div>'+blueprintFooterHTML()+'</div></div>';
+  // Group name is split into two lines ("NEW MATHERI" / "SELF HELP GROUP") when it ends in "Self Help Group"
+  var gn=DB.settings.groupName||'',gm=gn.match(/^(.*?)\s+(self[\s-]*help\s+group)$/i);
+  var nameHtml=gm?esc(gm[1])+'<small>'+esc(gm[2])+'</small>':esc(gn);
+  var dis=S.loginBusy?' disabled':'';
+  var enter=' onkeydown="if(event.key===\'Enter\')doLogin()"';
+  return'<div class="login-page">'+loginNoticeHtml+'<div class="login-center"><div class="login-win">'+
+    '<div class="lw-title"><i></i><span>LOGIN</span></div>'+
+    '<div class="lw-banner"><span class="lw-badge"><img src="'+IMG_HEADER_FULL+'" alt=""></span><div class="lw-name">'+nameHtml+'</div></div>'+
+    '<div class="lw-head"><h2>System Login</h2><p>Unity &amp; Progress</p></div>'+
+    '<div class="lw-form">'+(S.err?'<div class="login-err">'+esc(S.err)+'</div>':'')+
+    '<div class="lw-row"><label for="lu">Username</label><input id="lu" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false"'+dis+enter+'></div>'+
+    '<div class="lw-row"><label for="lp">Password</label><input id="lp" type="password" autocomplete="current-password"'+dis+enter+'></div>'+
+    '<div class="lw-row"><span></span><button class="lw-btn" onclick="doLogin()"'+dis+'>'+(S.loginBusy?'Signing in…':'Login')+'</button></div>'+
+    '</div>'+
+    '<div class="lw-foot"><img src="'+IMG_FOOTER+'" alt="Powered by Blueprint Smart Solutions" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'"><div class="lw-foot-fallback">BLUEPRINT SMART SOLUTIONS</div><div class="copyright">&copy; 2026 Blueprint Smart Solutions. All Rights Reserved.</div></div>'+
+    '</div></div></div>';
 }
 
 function blueprintFooterHTML(){

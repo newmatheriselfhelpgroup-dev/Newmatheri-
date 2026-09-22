@@ -791,16 +791,17 @@ function renderSessionModal(id){
   '<p style="font-size:.72rem;color:var(--muted);margin-bottom:0">Opened by '+esc(ses.startedBy)+(ses.status==='closed'?' &nbsp;·&nbsp; Closed by '+esc(ses.closedBy):' &nbsp;·&nbsp; <span class="pill pill-g">Still open</span>')+' &nbsp;|&nbsp; '+allRows.length+' contribution(s) recorded</p>'+
   statsBar+filterBar+
   '<div style="max-height:52vh;overflow:auto"><table><thead><tr><th>Member</th><th>Month Covered</th><th>Paid In</th><th>Deducted</th><th>To Contribution</th><th>Method</th>'+(canManageSessions()?'<th></th>':'')+'</tr></thead><tbody>'+
-  (rows.length?rows.map(function(r){
+  (function(){var seenMem={};allRows.forEach(function(r){seenMem[r.m.id]=(seenMem[r.m.id]||0)+1});return rows.length?rows.map(function(r){
     var lines=[];
+    var repeatBadge=seenMem[r.m.id]>1?' <span class="pill pill-a" title="This member has more than one contribution recorded in this session">'+seenMem[r.m.id]+'x this session</span>':'';
     if(r.deducted>0){
       r.items.forEach(function(it){lines.push('↪ '+kes(it.amount)+' cleared deduction — '+esc(it.reason))});
     }
     if(r.net>0){lines.push('↪ '+kes(r.net)+' covered '+esc(r.month))}
     else if(r.deducted>0){lines.push('↪ '+esc(r.month)+' not yet covered — full payment went to the deduction above')}
     var note=lines.length?'<div style="font-size:.66rem;color:var(--muted);margin-top:2px">'+lines.join('<br>')+'</div>':'';
-    return'<tr><td>'+esc(r.m.name)+note+'</td><td>'+esc(r.month)+'</td><td>'+kes(r.gross)+'</td><td style="color:'+(r.deducted>0?'var(--amber)':'var(--muted)')+'">'+(r.deducted>0?'-'+kes(r.deducted):'—')+'</td><td style="font-weight:700;color:var(--green)">'+kes(r.net)+'</td><td>'+esc(r.method)+'</td>'+(canManageSessions()?'<td style="white-space:nowrap"><button class="btn btn-sm btn-s" onclick="editSessionPayment('+r.p.id+')">Edit</button> <button class="btn btn-sm btn-d" onclick="deletePayment('+r.p.id+')">Delete</button></td>':'')+'</tr>';
-  }).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--muted)">No contributions match this filter.</td></tr>')+
+    return'<tr><td>'+esc(r.m.name)+repeatBadge+note+'</td><td>'+esc(r.month)+'</td><td>'+kes(r.gross)+'</td><td style="color:'+(r.deducted>0?'var(--amber)':'var(--muted)')+'">'+(r.deducted>0?'-'+kes(r.deducted):'—')+'</td><td style="font-weight:700;color:var(--green)">'+kes(r.net)+'</td><td>'+esc(r.method)+'</td>'+(canManageSessions()?'<td style="white-space:nowrap"><button class="btn btn-sm btn-s" onclick="editSessionPayment('+r.p.id+')">Edit</button> <button class="btn btn-sm btn-d" onclick="deletePayment('+r.p.id+')">Delete</button></td>':'')+'</tr>';
+  }).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--muted)">No contributions match this filter.</td></tr>'})()+
   '</tbody></table></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Close</button></div></div>';
 }
 
@@ -2166,16 +2167,16 @@ function payDeductionPrompt(id){
   if(amt>bal)amt=bal;
   d.paid+=amt;
   if(d.paid>=d.amount)d.status='Cleared';
-  // If this deduction is a campaign shortfall, also record it as a campaign
-  // payment so the campaign's own Paid/Balance figures stay in sync — but
-  // WITHOUT the viaDeduction flag, since this is cash paid directly against
-  // the deduction, not money skimmed out of a monthly contribution. Marking
-  // it viaDeduction would wrongly show it as "recovered from a monthly
-  // contribution" in the Yearly Statement and campaign history.
-  if(d.source==='campaign'&&d.campaignId){
-    DB.campaignPayments.push({id:nid('cp'),campaignId:d.campaignId,memberId:d.memberId,amount:amt,date:getToday(),method:'Cash',deductionId:d.id});
+  var recId,isCamp=d.source==='campaign'&&d.campaignId;
+  if(isCamp){
+    recId=nid('cp');
+    DB.campaignPayments.push({id:recId,campaignId:d.campaignId,memberId:d.memberId,amount:amt,date:getToday(),method:'Cash',deductionId:d.id});
+  }else{
+    recId=nid('dp');
+    DB.deductionPayments.push({id:recId,deductionId:d.id,memberId:d.memberId,amount:amt,date:getToday(),method:'Cash',reason:d.reason});
   }
   save();toast('Deduction payment recorded');render();
+  if(confirm('Payment recorded. Print a receipt now?'))printDedReceipt(recId,isCamp);
 }
 
 function renderEditDeductionModal(){
@@ -2216,7 +2217,7 @@ function renderDedPaymentsModal(){
     if(x.kind==='linked'){note='Taken from the monthly payment of '+esc(x.owner.date)+' &mdash; to change it, edit or delete that payment in Contributions'}
     else{
       note=x.kind==='orphan'?'<span style="color:var(--red)">The monthly payment this came from no longer exists</span>':'Recorded directly against this deduction';
-      btn='<button class="btn btn-sm btn-d" onclick="removeDedRecovery('+r.id+')">Remove</button>';
+      btn='<button class="btn btn-sm btn-d" onclick="removeDedRecovery('+r.id+')">Remove</button> <button class="btn btn-sm btn-g" onclick="printDedReceipt('+r.id+','+(info.isCamp?'true':'false')+')">Print</button>';
     }
     return'<tr><td>'+esc(r.date||'')+'</td><td>'+kes(r.amount)+'</td><td>'+esc(r.method||'')+'</td><td style="font-size:.68rem;color:var(--muted)">'+note+'</td><td>'+btn+'</td></tr>';
   }).join('');
@@ -2595,6 +2596,112 @@ function formatDateLong(dateStr){
 // This tries the normal print-window approach first, and if that fails,
 // falls back to downloading the printable page as an .html file the
 // person can open in a full browser and print/save as PDF from there.
+// --- BLUETOOTH THERMAL PRINTER (direct connection, no OS print dialog) ---
+// Uses the Web Bluetooth API to talk straight to a paired 58mm/80mm ESC/POS
+// receipt printer over BLE, so a receipt prints instantly without a Print
+// dialog appearing. Supported in Chrome/Edge on Android and Windows/desktop.
+// Not supported in Safari, so iPhones always use the "Print via device" method
+// further down, which still works with a Bluetooth printer if it has an
+// AirPrint/driver-based connection set up in iOS settings.
+var BT={device:null,server:null,char:null};
+// Cheap BLE thermal printers vary in which service they expose; these cover
+// the great majority in use (the common "000018f0"/"0000ff00" printer
+// profile, and the HM-10/Nordic UART-style serial modules some boards use).
+var BT_SERVICES=['000018f0-0000-1000-8000-00805f9b34fb','0000ff00-0000-1000-8000-00805f9b34fb','49535343-fe7d-4ae5-8fa9-9fafd205e455','0000ffe0-0000-1000-8000-00805f9b34fb','e7810a71-73ae-499d-8c15-faa9aef0c3f2','6e400001-b5a3-f393-e0a9-e50e24dcca9e'];
+function btSupported(){return!!(navigator.bluetooth)}
+function btConnected(){return!!(BT.char&&BT.device&&BT.device.gatt&&BT.device.gatt.connected)}
+function btPrinterName(){return BT.device?(BT.device.name||'Bluetooth printer'):''}
+function btConnect(){
+  if(!btSupported()){toast('This browser cannot connect to a Bluetooth printer directly. Use Chrome or Edge, or print via the device instead.');return}
+  navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:BT_SERVICES}).then(function(device){
+    BT.device=device;
+    return device.gatt.connect();
+  }).then(function(server){
+    BT.server=server;
+    return server.getPrimaryServices();
+  }).then(function(services){
+    var chain=Promise.resolve();var found=null;
+    services.forEach(function(svc){
+      chain=chain.then(function(){
+        if(found)return;
+        return svc.getCharacteristics().then(function(chars){
+          if(found)return;
+          var c=chars.find(function(x){return x.properties.write||x.properties.writeWithoutResponse});
+          if(c)found=c;
+        }).catch(function(){});
+      });
+    });
+    return chain.then(function(){return found});
+  }).then(function(chosen){
+    if(!chosen){toast('Connected to the device, but could not find a printable channel on it. This model may not be supported yet.');btDisconnect();return}
+    BT.char=chosen;
+    BT.device.addEventListener('gattserverdisconnected',function(){BT.device=null;BT.server=null;BT.char=null;if(S.page==='admin')render();});
+    toast('Bluetooth printer connected: '+btPrinterName());render();
+  }).catch(function(e){
+    if(e&&e.name==='NotFoundError')return; // user closed the device picker
+    toast('Could not connect: '+(e&&e.message?e.message:e));
+  });
+}
+function btDisconnect(){
+  try{if(BT.device&&BT.device.gatt&&BT.device.gatt.connected)BT.device.gatt.disconnect()}catch(e){}
+  BT.device=null;BT.server=null;BT.char=null;render();
+}
+function btWriteChunks(bytes){
+  var chunkSize=100,i=0;
+  function next(){
+    if(i>=bytes.length)return Promise.resolve();
+    var chunk=bytes.slice(i,i+chunkSize);i+=chunkSize;
+    var p=(BT.char.properties.writeWithoutResponse&&!BT.char.properties.write)?BT.char.writeValueWithoutResponse(chunk):BT.char.writeValue(chunk);
+    return p.then(function(){return new Promise(function(r){setTimeout(r,20)})}).then(next);
+  }
+  return next();
+}
+// Builds the raw ESC/POS byte stream for one receipt from the same structured
+// lines used to build the on-screen/printed HTML version (see receiptLines()).
+function escposBytes(lines){
+  var enc=new TextEncoder();
+  var chunks=[new Uint8Array([0x1B,0x40])]; // initialize printer
+  lines.forEach(function(l){
+    chunks.push(new Uint8Array([0x1B,0x61,l.align==='center'?0x01:(l.align==='right'?0x02:0x00)]));
+    if(l.bold)chunks.push(new Uint8Array([0x1B,0x45,0x01]));
+    if(l.dbl)chunks.push(new Uint8Array([0x1D,0x21,0x11])); else chunks.push(new Uint8Array([0x1D,0x21,0x00]));
+    chunks.push(enc.encode((l.text||'')+'\n'));
+    if(l.bold)chunks.push(new Uint8Array([0x1B,0x45,0x00]));
+    if(l.rule)chunks.push(enc.encode('--------------------------------\n'));
+  });
+  chunks.push(new Uint8Array([0x1B,0x61,0x00,0x0A,0x0A,0x0A]));
+  chunks.push(new Uint8Array([0x1D,0x56,0x42,0x00])); // partial cut
+  var total=0;chunks.forEach(function(c){total+=c.length});
+  var out=new Uint8Array(total),off=0;
+  chunks.forEach(function(c){out.set(c,off);off+=c.length});
+  return out;
+}
+// Turns a structured receipt (see receiptLines()) into the printable HTML
+// used by window.print() -- identical wording/order to the Bluetooth version.
+function receiptLinesToHTML(title,lines){
+  var body=lines.map(function(l){
+    var cls=(l.align==='center'?'center':'')+(l.rule?' rule':'')+(l.bold?' b':'')+(l.dbl?' dbl':'')+(l.small?' small':'');
+    return'<div class="'+cls.trim()+'">'+esc(l.text||'')+'</div>';
+  }).join('');
+  return'<html><head><meta charset="utf-8"><title>'+esc(title)+'</title><style>'+
+  '@page{size:80mm auto;margin:0}'+
+  'body{width:74mm;margin:0 auto;padding:6px 4px;font-family:\'Courier New\',monospace;font-size:12px;color:#000}'+
+  '.center{text-align:center}.b{font-weight:bold}.dbl{font-size:15px}.small{font-size:10px}'+
+  '.rule{border-top:1px dashed #000;margin-top:4px;padding-top:4px}'+
+  '</style></head><body>'+body+'</body></html>';
+}
+// One shared entry point for every receipt in the app (monthly contribution,
+// other-contribution/campaign payment, deduction payment). If a Bluetooth
+// printer is connected it prints straight to it; otherwise it opens the
+// normal device Print dialog, same as before.
+function printReceiptLines(title,lines){
+  if(btConnected()){
+    btWriteChunks(escposBytes(lines)).catch(function(e){toast('Bluetooth printer error: '+(e&&e.message?e.message:e)+' -- printing via the device instead.');openPrintableDoc(receiptLinesToHTML(title,lines),title)});
+    return;
+  }
+  openPrintableDoc(receiptLinesToHTML(title,lines),title);
+}
+
 // ─── THERMAL RECEIPT PRINTING (80mm roll printers) ───
 // Builds a narrow, receipt-styled slip for a single payment and sends it to
 // window.print(). Any printer already installed on the device — including a
@@ -2602,51 +2709,93 @@ function formatDateLong(dateStr){
 // virtually all 58mm/80mm receipt printers are set up on Windows/Android —
 // shows up as a normal choice in that print dialog, so no extra software is
 // needed beyond installing the printer once on the device.
-function receiptHTML(p,m){
+function receiptLines(p,m){
   var lines=[];
+  lines.push({text:esc(DB.settings.groupName),align:'center',bold:true,dbl:true});
+  lines.push({text:'Paybill: '+(DB.settings.paybill||'-')+'  Acc: '+(DB.settings.account||'-'),align:'center',small:true,rule:true});
+  var now=new Date();
+  lines.push({text:'Receipt #'+p.id});
+  lines.push({text:'Date: '+(p.date||'')+' '+now.toLocaleTimeString()});
+  lines.push({text:'Member: '+(m?m.name:'--')});
+  lines.push({text:'Member No.: '+(m?m.no:'--'),rule:true});
   (p.deductionItems||[]).forEach(function(item){
-    lines.push('<div class="rline"><span>Deduction: '+esc(item.reason)+'</span><span>'+kes(item.amount)+'</span></div>');
+    lines.push({text:'Deduction: '+(item.reason||'')+'  '+kes(item.amount)});
   });
   if(p.net>0||!p.deductionItems||!p.deductionItems.length){
-    lines.push('<div class="rline"><span>'+esc(p.month)+' contribution</span><span>'+kes(p.net!=null?p.net:p.amount)+'</span></div>');
+    lines.push({text:(p.month||'')+' contribution  '+kes(p.net!=null?p.net:p.amount)});
   }
   var bal=getMemberDeductionBal(p.memberId);
-  var now=new Date();
-  var timeStr=now.toLocaleTimeString();
-  return'<html><head><meta charset="utf-8"><title>Receipt #'+p.id+'</title><style>'+
-  '@page{size:80mm auto;margin:0}'+
-  'body{width:74mm;margin:0 auto;padding:6px 4px;font-family:\'Courier New\',monospace;font-size:12px;color:#000}'+
-  'h1{font-size:14px;text-align:center;margin:2px 0}'+
-  '.sub{text-align:center;font-size:10px;margin:1px 0}'+
-  'hr{border:none;border-top:1px dashed #000;margin:6px 0}'+
-  '.rline{display:flex;justify-content:space-between;margin:2px 0}'+
-  '.tot{display:flex;justify-content:space-between;margin:4px 0;font-weight:bold;font-size:13px}'+
-  '.center{text-align:center}'+
-  '.small{font-size:10px}'+
-  '</style></head><body>'+
-  '<h1>'+esc(DB.settings.groupName)+'</h1>'+
-  '<div class="sub">Paybill: '+esc(DB.settings.paybill||'-')+' &nbsp; Acc: '+esc(DB.settings.account||'-')+'</div>'+
-  '<hr>'+
-  '<div class="rline"><span>Receipt #</span><span>'+p.id+'</span></div>'+
-  '<div class="rline"><span>Date</span><span>'+esc(p.date)+' '+timeStr+'</span></div>'+
-  '<div class="rline"><span>Member</span><span>'+esc(m?m.name:'—')+'</span></div>'+
-  '<div class="rline"><span>Member No.</span><span>'+esc(m?m.no:'—')+'</span></div>'+
-  '<hr>'+
-  lines.join('')+
-  '<hr>'+
-  '<div class="tot"><span>Amount Paid</span><span>'+kes(p.amount)+'</span></div>'+
-  '<div class="rline small"><span>Method</span><span>'+esc(p.method)+(p.ref?' — '+esc(p.ref):'')+'</span></div>'+
-  (bal>0?'<div class="rline small"><span>Outstanding balance</span><span>'+kes(bal)+'</span></div>':'')+
-  '<hr>'+
-  '<div class="center small">Thank you — '+esc(DB.settings.groupName)+'<br>Unity &amp; Progress</div>'+
-  '</body></html>';
+  lines[lines.length-1].rule=true;
+  lines.push({text:'Amount Paid: '+kes(p.amount),bold:true,dbl:true});
+  lines.push({text:'Method: '+(p.method||'')+(p.ref?' -- '+p.ref:''),small:true});
+  if(bal>0)lines.push({text:'Outstanding balance: '+kes(bal),small:true});
+  lines[lines.length-1].rule=true;
+  lines.push({text:'Thank you -- '+esc(DB.settings.groupName),align:'center',small:true});
+  lines.push({text:'Unity & Progress',align:'center',small:true});
+  return lines;
 }
 function printReceipt(paymentId){
   var p=DB.payments.find(function(x){return x.id===paymentId});
   if(!p){toast('Payment not found');return}
   var m=DB.members.find(function(x){return x.id===p.memberId});
-  openPrintableDoc(receiptHTML(p,m),'receipt_'+p.id);
+  printReceiptLines('Receipt #'+p.id,receiptLines(p,m));
 }
+// ---- Other Contribution (campaign) payment receipt ----
+function campReceiptLines(cp,m,c){
+  var lines=[];
+  lines.push({text:esc(DB.settings.groupName),align:'center',bold:true,dbl:true});
+  lines.push({text:'Paybill: '+(DB.settings.paybill||'-')+'  Acc: '+(DB.settings.account||'-'),align:'center',small:true,rule:true});
+  var now=new Date();
+  lines.push({text:'Receipt #'+cp.id});
+  lines.push({text:'Date: '+(cp.date||'')+' '+now.toLocaleTimeString()});
+  lines.push({text:'Member: '+(m?m.name:'--')});
+  lines.push({text:'Member No.: '+(m?m.no:'--'),rule:true});
+  lines.push({text:(c?c.title:'Other Contribution')});
+  var paid=DB.campaignPayments.filter(function(x){return x.campaignId===cp.campaignId&&x.memberId===cp.memberId}).reduce(function(t,x){return t+x.amount},0);
+  var bal=c?c.amount-paid:0;
+  lines[lines.length-1].rule=true;
+  lines.push({text:'Amount Paid: '+kes(cp.amount),bold:true,dbl:true});
+  lines.push({text:'Method: '+(cp.method||'')+(cp.ref?' -- '+cp.ref:''),small:true});
+  if(bal>0)lines.push({text:'Balance remaining: '+kes(bal),small:true});
+  lines[lines.length-1].rule=true;
+  lines.push({text:'Thank you -- '+esc(DB.settings.groupName),align:'center',small:true});
+  lines.push({text:'Unity & Progress',align:'center',small:true});
+  return lines;
+}
+function printCampReceipt(cpId){
+  var cp=DB.campaignPayments.find(function(x){return x.id===cpId});
+  if(!cp){toast('Payment not found');return}
+  var m=DB.members.find(function(x){return x.id===cp.memberId}),c=DB.campaigns.find(function(x){return x.id===cp.campaignId});
+  printReceiptLines('Receipt #'+cp.id,campReceiptLines(cp,m,c));
+}
+// ---- Deduction payment receipt (money paid directly against a deduction, not via a monthly contribution) ----
+function dedReceiptLines(rec,m,d){
+  var lines=[];
+  lines.push({text:esc(DB.settings.groupName),align:'center',bold:true,dbl:true});
+  lines.push({text:'Paybill: '+(DB.settings.paybill||'-')+'  Acc: '+(DB.settings.account||'-'),align:'center',small:true,rule:true});
+  var now=new Date();
+  lines.push({text:'Receipt #'+rec.id});
+  lines.push({text:'Date: '+(rec.date||'')+' '+now.toLocaleTimeString()});
+  lines.push({text:'Member: '+(m?m.name:'--')});
+  lines.push({text:'Member No.: '+(m?m.no:'--'),rule:true});
+  lines.push({text:(d?d.reason:'Deduction')});
+  var bal=d?d.amount-d.paid:0;
+  lines[lines.length-1].rule=true;
+  lines.push({text:'Amount Paid: '+kes(rec.amount),bold:true,dbl:true});
+  lines.push({text:'Method: '+(rec.method||''),small:true});
+  if(bal>0)lines.push({text:'Balance remaining: '+kes(bal),small:true});
+  lines[lines.length-1].rule=true;
+  lines.push({text:'Thank you -- '+esc(DB.settings.groupName),align:'center',small:true});
+  lines.push({text:'Unity & Progress',align:'center',small:true});
+  return lines;
+}
+function printDedReceipt(recId,isCamp){
+  var rec=(isCamp?DB.campaignPayments:DB.deductionPayments).find(function(x){return x.id===recId});
+  if(!rec){toast('Payment not found');return}
+  var m=DB.members.find(function(x){return x.id===rec.memberId}),d=DB.deductions.find(function(x){return x.id===rec.deductionId});
+  printReceiptLines('Receipt #'+rec.id,dedReceiptLines(rec,m,d));
+}
+
 function openPrintableDoc(html,filenameBase){
   var w=null;
   try{w=window.open('','_blank')}catch(e){w=null}
@@ -3898,6 +4047,13 @@ function renderAdminSettings(){
   '<button class="btn btn-p" onclick="downloadBackup()" style="margin-right:6px">⬇ Download Backup (JSON)</button>'+
   '<input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreBackup(this)">'+
   '<button class="btn btn-s" onclick="document.getElementById(\'restoreFile\').click()">⬆ Restore From Backup</button>'+
+  '<div class="pnl"><div class="pnl-t"><h3>Receipt Printer</h3></div><div style="padding:14px">'+
+  '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">Connect a Bluetooth thermal receipt printer so contribution, deduction and other-contribution receipts print straight to it -- no Print dialog. Works in Chrome or Edge on Android/Windows; not supported in Safari/iPhone.</p>'+
+  (btConnected()?
+    '<p style="font-size:.8rem;margin-bottom:8px"><span class="pill pill-g">&#9679; Connected</span> &nbsp;'+esc(btPrinterName())+'</p><button class="btn btn-s" onclick="btDisconnect()">Disconnect</button>'
+    :'<button class="btn btn-p" onclick="btConnect()">&#128243; Connect Bluetooth Printer</button>'+(btSupported()?'':'<p style="font-size:.68rem;color:var(--red);margin-top:8px">This browser does not support connecting to a Bluetooth printer directly.</p>'))+
+  '<p style="font-size:.68rem;color:var(--muted);margin-top:10px">Without a Bluetooth printer connected, every receipt still prints normally through the device\'s own Print dialog, which also works with a Bluetooth printer that has a driver installed on the phone/computer.</p>'+
+  '</div></div>'+
   '<div class="pnl"><div class="pnl-t"><h3>Cloud Sync</h3></div><div style="padding:14px">'+
   '<p style="font-size:.72rem;color:var(--muted);margin-bottom:10px">This device automatically stays in sync with the shared cloud copy. Use the buttons below only if you need to force a direction — for example, moving data that was entered on this device before cloud sync was set up, up to become the live shared version.</p>'+
   '<button class="btn btn-p" onclick="uploadLocalToCloud()" style="margin-right:6px">⬆ Upload This Device\'s Data (overwrite cloud)</button>'+
@@ -4202,7 +4358,7 @@ function renderRecordPaymentModal(){
   return'<div class="mbox"><div class="mhd"><h3>Record Payment</h3><button class="btn btn-sm btn-s" onclick="S.modal=null;render()">✕</button></div><div class="fg">'+
   '<div class="field" style="grid-column:1/-1"><label>Search Member (type name, number or ID)</label><input id="pMemSearch" list="pMemList" placeholder="Start typing to auto-detect member..." oninput="onPaymentMemberSearch(this.value)"><datalist id="pMemList">'+mems.map(function(m){return'<option value="'+esc(m.name)+' ('+m.no+')">';}).join('')+'</datalist><input type="hidden" id="pMem"></div>'+
   '<div id="pMemInfo" style="grid-column:1/-1;font-size:.72rem;color:var(--muted);margin:-4px 0 6px">Select a member to see age eligibility and balances.</div>'+
-  '<div class="field"><label>Amount (KES)</label><input id="pAmt" type="number" value="'+DB.settings.monthlyAmount+'"></div><div class="field"><label>Method</label><select id="pMet" onchange="onPaymentMethodChange()"><option>Cash</option><option>M-Pesa</option><option>Bank Transfer</option></select></div><div class="field" style="grid-column:1/-1"><label id="pRefLabel">Reference (optional for cash)</label><input id="pRef" placeholder="e.g. QK7X9ABCDE — paste the M-Pesa confirmation message or bank slip no."></div><div class="field"><label>Month</label><input id="pMon" value="Aug 2026"></div><div class="field"><label>Date</label><input id="pDat" type="date" value="'+getToday()+'"></div></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Cancel</button><button class="btn btn-p" onclick="recordPayment()">Record</button></div></div>';
+    '<div class="field"><label>Amount (KES)</label><input id="pAmt" type="number" value="" placeholder="Type the amount handed over -- e.g. '+DB.settings.monthlyAmount+'" autocomplete="off"></div><div class="field"><label>Method</label><select id="pMet" onchange="onPaymentMethodChange()"><option>Cash</option><option>M-Pesa</option><option>Bank Transfer</option></select></div><div class="field" style="grid-column:1/-1"><label id="pRefLabel">Reference (optional for cash)</label><input id="pRef" placeholder="e.g. QK7X9ABCDE — paste the M-Pesa confirmation message or bank slip no."></div><div class="field"><label>Month <span style="font-weight:400;color:var(--muted);font-size:.9em">(set from the date)</span></label><input id="pMon" value="'+monthLabelForDate(getToday())+'" readonly style="background:var(--bg2);color:var(--muted)"></div><div class="field"><label>Date</label><input id="pDat" type="date" value="'+getToday()+'" onchange="document.getElementById(\'pMon\').value=monthLabelForDate(this.value||getToday())"></div></div><div class="mft"><button class="btn btn-s" onclick="S.modal=null;render()">Cancel</button><button class="btn btn-p" onclick="recordPayment()">Record</button></div></div>';
 }
 
 function renderEditPaymentModal(){
@@ -4281,7 +4437,17 @@ function onPaymentMemberSearch(v){
   if(dedBal>0)msg+=autoDeductEnabled()
     ?'<br><span style="color:var(--amber);font-weight:700">↪ '+kes(dedBal)+' will be automatically deducted from this payment to clear the outstanding amount. The rest goes to the monthly contribution.</span>'
     :'<br><span style="color:var(--red);font-weight:700">⚠ Outstanding deductions must be paid before recording a monthly contribution.</span>';
+  var sesPays=memberSessionPayments(m.id);
+  if(sesPays.length)msg+='<br><span style="color:var(--red);font-weight:700">⚠ Already recorded '+sesPays.length+' contribution(s) for '+esc(m.name)+' in this session: '+sesPays.map(function(x){return kes(x.amount)}).join(', ')+'. Check before recording another one.</span>';
   infoEl.innerHTML=msg;
+}
+// Every contribution already recorded for this member in the CURRENTLY OPEN
+// collection session -- used to warn against double entry before it happens,
+// both live as soon as a member is picked and again as a final check on Record.
+function memberSessionPayments(mid){
+  var ses=getActiveSession();
+  if(!ses)return[];
+  return DB.payments.filter(function(p){return p.memberId===mid&&p.sessionId===ses.id});
 }
 
 // Beneficiary of an Other Contribution / Campaign must be picked from the members
@@ -4361,8 +4527,10 @@ function recordCampaignPaymentPrompt(cid,mid){
   var amt=parseInt(v)||0;
   if(amt<=0){toast('Enter a valid amount');return}
   if(amt>bal)amt=bal;
-  DB.campaignPayments.push({id:nid('cp'),campaignId:cid,memberId:mid,amount:amt,date:getToday(),method:'Cash'});
+  var newId=nid('cp');
+  DB.campaignPayments.push({id:newId,campaignId:cid,memberId:mid,amount:amt,date:getToday(),method:'Cash'});
   save();toast('Payment recorded for '+m.name);render();
+  if(confirm('Payment recorded. Print a receipt now?'))printCampReceipt(newId);
 }
 
 // ---- Edit / delete the payments recorded against an Other Contribution (campaign) ----
@@ -4389,7 +4557,7 @@ function renderEditCampPayModal(){
   var rows=list.map(function(p){
     if(isDirectCampPay(p)){
       var methods=['Cash','M-Pesa','Bank Transfer'];if(p.method&&methods.indexOf(p.method)===-1)methods.push(p.method);
-      return'<tr><td><input type="date" id="cpd_'+p.id+'" value="'+esc(p.date||'')+'" style="'+inp+'"></td><td><input type="number" id="cpa_'+p.id+'" value="'+p.amount+'" min="1" style="width:90px;'+inp+'"></td><td><select id="cpm_'+p.id+'" style="'+inp+'">'+methods.map(function(x){return'<option'+((p.method||'Cash')===x?' selected':'')+'>'+esc(x)+'</option>'}).join('')+'</select></td><td style="white-space:nowrap"><button class="btn btn-sm btn-p" onclick="saveCampPayment('+p.id+')">Save</button> <button class="btn btn-sm btn-d" onclick="deleteCampPayment('+p.id+')">Delete</button></td></tr>';
+      return'<tr><td><input type="date" id="cpd_'+p.id+'" value="'+esc(p.date||'')+'" style="'+inp+'"></td><td><input type="number" id="cpa_'+p.id+'" value="'+p.amount+'" min="1" style="width:90px;'+inp+'"></td><td><select id="cpm_'+p.id+'" style="'+inp+'">'+methods.map(function(x){return'<option'+((p.method||'Cash')===x?' selected':'')+'>'+esc(x)+'</option>'}).join('')+'</select></td><td style="white-space:nowrap"><button class="btn btn-sm btn-p" onclick="saveCampPayment('+p.id+')">Save</button> <button class="btn btn-sm btn-d" onclick="deleteCampPayment('+p.id+')">Delete</button> <button class="btn btn-sm btn-g" onclick="printCampReceipt('+p.id+')">Print</button></td></tr>';
     }
     return'<tr><td>'+esc(p.date||'')+'</td><td>'+kes(p.amount)+'</td><td>'+esc(p.method||'')+'</td><td style="font-size:.68rem;color:var(--muted)">'+(p.viaDeduction?'Taken from a monthly contribution &mdash; change it by editing that monthly payment':'Paid through Deductions &mdash; change it in the Deductions page')+'</td></tr>';
   }).join('');
@@ -4591,6 +4759,8 @@ function recordPayment(){
   if(method!=='Cash'&&!ref){toast((method==='M-Pesa'?'The M-Pesa confirmation message/code':'The bank reference number')+' is required for '+method+' payments');return}
   var dupRef=findDuplicatePaymentRef(ref);
   if(dupRef){var dm=DB.members.find(function(x){return x.id===dupRef.memberId});toast('This reference/confirmation code has already been recorded — for '+(dm?dm.name:'a member')+' on '+dupRef.date+'. Duplicate payments are not allowed.');return}
+  var sesPays=memberSessionPayments(mid);
+  if(sesPays.length&&!confirm(m.name+' already has '+sesPays.length+' contribution(s) recorded in this session ('+sesPays.map(function(x){return kes(x.amount)}).join(', ')+'). Record this as another, separate contribution?'))return;
   var dupGen=findDuplicatePaymentGeneral(mid,amount,month);
   if(dupGen&&!confirm(m.name+' already has a payment of '+kes(amount)+' recorded for '+month+' (on '+dupGen.date+'). Record this one anyway?'))return;
   if(!autoDeductEnabled()&&!memberCanPayMonthly(mid)){toast(m.name+' has outstanding deductions of '+kes(getMemberDeductionBal(mid))+'. Clear deductions first.');return}

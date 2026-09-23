@@ -316,13 +316,118 @@ function mergeCloudIntoLocal(oldDB,newDB){
   (merged.members||[]).forEach(function(m){var old=oldMembersById[m.id];if(old&&old.customPassword&&!m.customPassword)m.customPassword=old.customPassword;});
   return merged;
 }
+// ── POST-MERGE DEDUPE ──────────────────────────────────────────────────────
+// mergeArraysById (above) reconciles records purely by id. That's correct for
+// the same record edited on two devices, but it can't catch the OTHER case:
+// the same real member (or the same real payment) entered independently on
+// two devices before they ever synced with each other. Each device hands out
+// its own id (DEVICE_SALT keeps them from colliding), so both copies survive
+// the id-based merge as two separate records — that's the "duplicate members
+// and duplicate contributions after syncing" symptom. This pass runs right
+// after every cloud merge and collapses those look-alikes into one, remapping
+// every other record that pointed at the id being dropped so nothing (a
+// payment, a deduction, a dependent...) is left pointing at a member that no
+// longer exists.
+function remapMemberId(oldId,newId){
+  if(oldId===newId)return;
+  ['payments','campaignPayments','deductions','deductionPayments','dependents'].forEach(function(key){
+    (DB[key]||[]).forEach(function(r){if(r.memberId===oldId)r.memberId=newId});
+  });
+  (DB.smsLog||[]).forEach(function(s){
+    if(s.memberIds)s.memberIds=s.memberIds.map(function(id){return id===oldId?newId:id});
+  });
+  Object.keys(DB.settings.houseReps||{}).forEach(function(h){
+    if(DB.settings.houseReps[h]===oldId)DB.settings.houseReps[h]=newId;
+  });
+  (DB.users||[]).forEach(function(u){if(u.memberId===oldId)u.memberId=newId});
+}
+// Same match rules as findDuplicateMember (National ID, or phone, or name+house) but
+// scanning the whole list for pairs instead of checking one candidate against it.
+function dedupeMembers(){
+  var now=Date.now(),kept=[],removed=0;
+  DB.members.slice().sort(function(a,b){return a.id-b.id}).forEach(function(m){
+    var dup=kept.find(function(k){
+      var idNo=(m.idNo||'').trim().toLowerCase(),kIdNo=(k.idNo||'').trim().toLowerCase();
+      if(idNo&&kIdNo&&idNo===kIdNo)return true;
+      var ph=normPhoneForDup(m.phone),kph=normPhoneForDup(k.phone);
+      if(ph&&ph.length>=7&&ph===kph)return true;
+      var nm=(m.name||'').trim().toLowerCase().replace(/\s+/g,' '),knm=(k.name||'').trim().toLowerCase().replace(/\s+/g,' ');
+      var hs=(m.house||'').trim().toLowerCase(),khs=(k.house||'').trim().toLowerCase();
+      if(nm&&nm===knm&&hs&&hs===khs)return true;
+      return false;
+    });
+    if(dup){
+      // Keep the older (lower-id) record but fill any blanks on it from the duplicate first.
+      ['idNo','phone','dob','house','position','status'].forEach(function(f){if(!dup[f]&&m[f])dup[f]=m[f]});
+      remapMemberId(m.id,dup.id);
+      DB.tomb=DB.tomb||{};DB.tomb.members=DB.tomb.members||{};DB.tomb.members[m.id]=now;
+      removed++;
+    }else kept.push(m);
+  });
+  if(removed)DB.members=kept;
+  return removed;
+}
+// For payments / campaignPayments / deductionPayments: only collapse records where
+// EVERY listed field matches exactly. A same-member, same-amount, same-month payment
+// with a different date or reference is left alone — it's the exact-match case that
+// reliably means "the same entry, synced from two devices", not two real payments.
+function dedupeExactArray(key,fields){
+  var now=Date.now(),kept=[],removed=0;
+  (DB[key]||[]).slice().sort(function(a,b){return a.id-b.id}).forEach(function(r){
+    var dup=kept.find(function(k){return fields.every(function(f){return(k[f]||'')===(r[f]||'')})});
+    if(dup){
+      DB.tomb=DB.tomb||{};DB.tomb[key]=DB.tomb[key]||{};DB.tomb[key][r.id]=now;
+      removed++;
+    }else kept.push(r);
+  });
+  if(removed)DB[key]=kept;
+  return removed;
+}
+function dedupeAfterMerge(){
+  var n=0;
+  n+=dedupeMembers();
+  n+=dedupeExactArray('payments',['memberId','amount','date','method','ref','month']);
+  n+=dedupeExactArray('campaignPayments',['campaignId','memberId','amount','date','method','ref']);
+  n+=dedupeExactArray('deductionPayments',['deductionId','memberId','amount','date','method','ref']);
+  return n;
+}
 function applyCloudMerge(cloudData){
   DB=mergeCloudIntoLocal(DB,cloudData);
+  var removed=dedupeAfterMerge();
   resetSyncBaseline();
+  if(removed&&isOfficial())pushToCloud(); // clean copy goes back up so other devices stop re-receiving the duplicates
 }
+// Signature of everything a push would actually send, so a record that has
+// already reached the server (successfully) is never re-sent as if it were new --
+// that repeated re-sending is what was doubling up records when several devices
+// (and several people's background timers) were each pushing the same data.
+var lastPushedSig=null;
+// Timestamp of the last record actually accepted by the server. Used only to COUNT how many
+// records have changed since then (for the "N changes pending" badge) — it does not change what
+// gets sent; the push itself still sends the full merged snapshot (see pushToCloud), because the
+// save_group_data_secure RPC replaces the whole stored row rather than merging partial data.
+var lastPushSuccessTime=parseInt(localStorage.getItem(V+'_lastPush')||'0',10)||0;
+function markPushSuccess(){lastPushSuccessTime=Date.now();try{localStorage.setItem(V+'_lastPush',String(lastPushSuccessTime))}catch(e){}}
+function countPendingChanges(){
+  var n=0;
+  SYNC_KEYS.forEach(function(k){
+    syncArr(DB,k).forEach(function(it){if(it&&it._u&&it._u>lastPushSuccessTime)n++});
+  });
+  var tomb=DB.tomb||{};
+  Object.keys(tomb).forEach(function(k){
+    var m=tomb[k]||{};
+    Object.keys(m).forEach(function(id){if(m[id]>lastPushSuccessTime)n++});
+  });
+  var su=DB._su||{};
+  Object.keys(su).forEach(function(k){if(su[k]>lastPushSuccessTime)n++});
+  return n;
+}
+function dbSyncSignature(){return JSON.stringify(snapshotForSync(DB))}
 function pushToCloud(){
+  if(!isOfficial())return; // Members / House Reps never write to the server -- pull only
   if(cloudSyncTimer)clearTimeout(cloudSyncTimer);
   cloudSyncTimer=setTimeout(function(){
+    if(!isOfficial())return; // role may have changed (e.g. logout) while this was waiting
     try{trackChanges()}catch(e){}
     if(!SESSION_U){return} // not logged in — nothing to authenticate the write with
     if(navigator.onLine===false){
@@ -343,6 +448,15 @@ function pushToCloud(){
           localStorage.setItem(V,JSON.stringify(DB));
           if(!S.modal)render();
         }
+        // Nothing changed since the last record we actually sent up? Then there is
+        // nothing new to transfer -- skip the write entirely instead of re-sending
+        // the same records again (that repeat re-sending is what caused duplicates).
+        var sig=dbSyncSignature();
+        if(sig===lastPushedSig){
+          pendingSync=false;
+          if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
+          return;
+        }
         var now=new Date().toISOString();
         return fetch(SUPABASE_URL+'/rest/v1/rpc/save_group_data_secure',{
           method:'POST',
@@ -357,7 +471,7 @@ function pushToCloud(){
             }
           });
         }).then(function(){
-          lastCloudUpdatedAt=now;pendingSync=false;
+          lastCloudUpdatedAt=now;pendingSync=false;lastPushedSig=sig;markPushSuccess();
           if(typeof syncState!=='undefined'){syncState='synced';refreshSyncBtn()}
         });
       }).catch(function(e){
@@ -366,7 +480,7 @@ function pushToCloud(){
       if(typeof syncState!=='undefined'){syncState=(navigator.onLine===false?'offline':'error');refreshSyncBtn()}
       toast('Sync failed: '+e.message);
     });
-  },1200);
+  },60000); // wait a full minute of quiet after the last edit before actually sending to the server
 }
 window.addEventListener('online',function(){if(pendingSync)pushToCloud()});
 
@@ -446,7 +560,11 @@ function pullFromCloud(cb){
     })
     .catch(function(e){console.warn('Cloud pull failed:',e);if(typeof syncState!=='undefined'){syncState='error';refreshSyncBtn()}if(cb)cb(false)});
 }
-function save(){try{trackChanges()}catch(e){console.warn('Change tracking failed:',e)}localStorage.setItem(V,JSON.stringify(DB));pushToCloud()}
+// Only Admin / Secretary / Officer accounts are allowed to write to the shared cloud copy.
+// Members and House Reps read the shared data (pull) but never push their local copy up --
+// this is what stops a Member's device from ever re-sending old/duplicate records to the server.
+function isOfficial(){return!!(S.user&&(S.role==='Admin'||S.role==='Secretary'||S.role==='Officer'))}
+function save(){try{trackChanges()}catch(e){console.warn('Change tracking failed:',e)}localStorage.setItem(V,JSON.stringify(DB));if(isOfficial()){if(countPendingChanges()>0)pendingSync=true;pushToCloud()}}
 
 // ─── TAP-TO-SEND SMS (opens phone's Messages app, pre-filled) ───
 function normalizePhoneForSms(phone){
@@ -476,6 +594,8 @@ function syncStatusLabel(){
   if(syncState==='syncing')return'⏳ Syncing…';
   if(syncState==='offline')return'📴 Offline — saved locally, will sync';
   if(syncState==='error')return'⚠ Sync failed — tap to retry';
+  var n=isOfficial()?countPendingChanges():0;
+  if(n>0)return'⏳ '+n+' change'+(n===1?'':'s')+' pending sync';
   if(pendingSync)return'⏳ Changes pending sync';
   if(lastCloudUpdatedAt)return'☁ Synced — tap to refresh';
   return'☁ Sync Now';
@@ -484,7 +604,7 @@ function refreshSyncBtn(){var b=document.getElementById('syncBtn');if(b)b.textCo
 function manualSync(){
   syncState='syncing';refreshSyncBtn();
   if(!SESSION_U){syncState='error';refreshSyncBtn();toast('Not logged in — cannot sync');return}
-  fetch(SUPABASE_URL+'/rest/v1/rpc/get_group_data_secure',{
+  fetch(SUPABASE_URL+'/rest/v1/rpc/get_group_data_secure',{ // pull is always allowed, for every role
     method:'POST',headers:cloudHeaders(),
     body:JSON.stringify({p_username:SESSION_U,p_password:SESSION_P})
   })
@@ -506,10 +626,14 @@ function manualSync(){
         syncState='synced';
         toast('Updated with latest shared data');
         render();
-      } else {
+      } else if(isOfficial()){
         pushToCloud();
         syncState='synced';
         toast('No shared data found yet — this device is now the starting copy');
+        refreshSyncBtn();
+      } else {
+        syncState='synced';
+        toast('No shared data on the server yet — ask an Admin, Secretary or Officer to sync first');
         refreshSyncBtn();
       }
     })
@@ -577,6 +701,11 @@ if(!('autoDeduct' in DB.settings))DB.settings.autoDeduct=true;
 DB.payments.forEach(function(p){if(p.gross===undefined){p.gross=p.amount;p.deducted=0}});
 DB.expenses.forEach(function(e){if(!e.paidFrom)e.paidFrom='Cash'});
 DB.bankDeposits.forEach(function(d){if(!d.type)d.type='Deposit'});
+// One-time cleanup for installs that already picked up duplicate members/payments from
+// syncing before this dedupe pass existed (see dedupeAfterMerge / applyCloudMerge above).
+// Runs once at startup; if it finds anything, save() below pushes the cleaned copy up so
+// other devices stop re-receiving the duplicates on their next pull.
+if(dedupeAfterMerge())save();
 
 var S={user:null,role:null,page:'dashboard',modal:null,toast:null,err:'',adminTab:'members',memberListTab:'active',houseFilter:'All',reportView:null,viewMemberId:null,editMemberId:null,campaignFocusId:null,monthSessionKey:null,monthSessionLabel:null,campaignSort:'name',qlStartMonth:0,qlStartYear:new Date().getFullYear(),assetIncomeFor:null,editUserId:null,resetUserId:null,expandedContribDate:null};
 document.documentElement.style.setProperty('--bg-image','url("'+IMG_BG+'")');
@@ -5023,8 +5152,8 @@ function initCharts(){
 render();
 setInterval(function(){
   if(!S.user)return; // logged out — never sync or touch cloud data while on the login screen
-  if(pendingSync){pushToCloud();} // prioritize pushing unsynced offline changes first
-  else{pullFromCloud(function(changed){if(changed&&!S.modal)render()});}
+  if(isOfficial()&&pendingSync){pushToCloud();} // officials: prioritize pushing unsynced changes first
+  else{pullFromCloud(function(changed){if(changed&&!S.modal)render()});} // everyone else (and officials with nothing pending): pull only
   if(DB.notice&&!S.modal)render();
 },15000);
 if('serviceWorker' in navigator && location.protocol!=='file:'){

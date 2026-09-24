@@ -659,17 +659,36 @@ function save(){try{trackChanges()}catch(e){console.warn('Change tracking failed
 
 // ─── TAP-TO-SEND SMS (opens phone's Messages app, pre-filled) ───
 function normalizePhoneForSms(phone){
-  var clean=(phone||'').replace(/[\s\-()]/g,'');
+  var clean=String(phone==null?'':phone).replace(/[\s\-()\.]/g,'');
   if(!clean)return'';
   if(clean.charAt(0)==='+')return clean;
   if(clean.indexOf('254')===0)return'+'+clean;
   if(clean.charAt(0)==='0')return'+254'+clean.slice(1);
+  if(/^[71]\d{8}$/.test(clean))return'+254'+clean; // number stored without leading 0 (e.g. from Excel)
   return clean;
+}
+function smsHref(phone,message){
+  var ios=/iPad|iPhone|iPod/.test(navigator.userAgent||'');
+  return'sms:'+phone+(ios?'&':'?')+'body='+encodeURIComponent(message).replace(/'/g,'%27');
 }
 function openSmsCompose(phone,message){
   var clean=normalizePhoneForSms(phone);
   if(!clean){toast('No phone number on file for this member — SMS not sent');return}
-  window.location.href='sms:'+clean+'?body='+encodeURIComponent(message);
+  S.smsPrompt={phone:clean,message:message};
+  render();
+}
+function closeSmsPrompt(){S.smsPrompt=null;render()}
+function copySmsPrompt(){
+  var p=S.smsPrompt;if(!p)return;
+  try{navigator.clipboard.writeText(p.message).then(function(){toast('Message copied')})}catch(e){toast('Could not copy — select the text manually')}
+}
+function renderSmsPrompt(){
+  var p=S.smsPrompt;if(!p)return'';
+  return'<div class="mbg" style="z-index:200"><div class="mbox" style="width:min(420px,100%)"><div class="mhd"><h3>📩 Send SMS confirmation</h3><button class="btn btn-sm btn-s" onclick="closeSmsPrompt()">✕</button></div>'+
+  '<div style="font-size:.8rem;margin-bottom:8px"><b>'+esc(p.name||'')+'</b> · '+esc(p.phone)+'</div>'+
+  '<div style="font-size:.78rem;background:#f4f4f4;border-radius:8px;padding:10px;margin-bottom:12px;white-space:pre-wrap">'+esc(p.message)+'</div>'+
+  '<div class="mft"><button class="btn btn-s" onclick="closeSmsPrompt()">Skip</button><button class="btn btn-s" onclick="copySmsPrompt()">Copy</button>'+
+  '<a class="btn btn-p" href="'+esc(smsHref(p.phone,p.message))+'" onclick="setTimeout(closeSmsPrompt,600)" style="text-decoration:none">Open Messages</a></div></div></div>';
 }
 function paymentConfirmMessage(member,amount,month){
   var bal=getMemberBalance(member.id);
@@ -678,7 +697,13 @@ function paymentConfirmMessage(member,amount,month){
 function sendPaymentConfirmationSMS(member,amount,month){
   if(!member)return;
   if(!member.phone){toast('Payment saved — no phone number on file for '+member.name+', so no SMS was sent');return}
-  openSmsCompose(member.phone,paymentConfirmMessage(member,amount,month));
+  try{
+    var msg=paymentConfirmMessage(member,amount,month);
+    var clean=normalizePhoneForSms(member.phone);
+    if(!clean){toast('Payment saved — invalid phone number for '+member.name+', so no SMS was sent');return}
+    S.smsPrompt={name:member.name,phone:clean,message:msg};
+    render();
+  }catch(e){console.warn('SMS prompt failed:',e);toast('Payment saved — SMS could not be prepared')}
 }
 var syncState='idle'; // idle | syncing | synced | error
 function syncStatusLabel(){
@@ -1726,7 +1751,7 @@ function render(){
   try{
     processCampaignDueDeductions();
     reconcileCampaignDeductionPayments();
-    app.innerHTML=renderShell()+(S.modal?renderModal():'')+(S.toast?'<div class="toast">'+esc(S.toast)+'</div>':'');
+    app.innerHTML=renderShell()+(S.modal?renderModal():'')+(S.smsPrompt?renderSmsPrompt():'')+(S.toast?'<div class="toast">'+esc(S.toast)+'</div>':'');
     wrapTables(app);
     if(S.page==='dashboard'&&(S.role==='Admin'||S.role==='Secretary'||S.role==='Officer'))initCharts();
   }catch(e){

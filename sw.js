@@ -1,50 +1,50 @@
-// Matheri SHG — offline app-shell cache.
-// Bump CACHE when you upload a new version of the HTML so old clients pick it up.
+// Matheri SHG — offline support.
+// The app opens instantly from the phone's storage; when internet is available it quietly
+// fetches the newest version in the background (shown the next time the app is opened).
+// Cloud sync calls (Supabase) are never touched here — the app handles those itself.
 const CACHE = 'matheri-shg-v1';
+const PRECACHE = ['./', './manifest.json', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
 
-// Adjust the HTML filename below if this app's page isn't named index.html on your host.
-const ASSETS = [
-  './',
-  'index.html',
-  'manifest.json',
-  'icon-192.png',
-  'https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.min.js',
-  'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'
-];
-
-self.addEventListener('install', function(e){
+self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(CACHE)
-      .then(function(c){ return c.addAll(ASSETS); })
-      .catch(function(){ /* one of the assets failed to fetch during install — don't block activation */ })
+      .then(c => Promise.all(PRECACHE.map(u => c.add(u).catch(() => {}))))
+      .then(() => self.skipWaiting())
   );
-  self.skipWaiting();
 });
 
-self.addEventListener('activate', function(e){
+self.addEventListener('activate', e => {
   e.waitUntil(
-    caches.keys().then(function(keys){
-      return Promise.all(keys.filter(function(k){ return k!==CACHE; }).map(function(k){ return caches.delete(k); }));
-    })
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
-// Stale-while-revalidate: serve from cache instantly if we have it (so offline
-// opens work and repeat opens are fast), and refresh the cache in the background
-// whenever there IS a network connection.
-self.addEventListener('fetch', function(e){
-  if(e.request.method!=='GET') return; // never intercept the Supabase POST calls
+self.addEventListener('fetch', e => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  if (url.origin !== location.origin) return; // cloud/API calls go straight to the network
+
+  if (req.mode === 'navigate') {
+    e.respondWith(
+      caches.match(req, { ignoreSearch: true }).then(cached => {
+        const network = fetch(req).then(res => {
+          if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
+          return res;
+        }).catch(() => null);
+        if (cached) { e.waitUntil(network); return cached; }
+        return network.then(res => res || caches.match('./') || caches.match('index.html'));
+      })
+    );
+    return;
+  }
+
   e.respondWith(
-    caches.match(e.request).then(function(cached){
-      const fetchPromise = fetch(e.request).then(function(networkResponse){
-        if(networkResponse && networkResponse.status===200){
-          const copy = networkResponse.clone();
-          caches.open(CACHE).then(function(c){ c.put(e.request, copy); });
-        }
-        return networkResponse;
-      }).catch(function(){ return cached; });
-      return cached || fetchPromise;
-    })
+    caches.match(req).then(cached => cached || fetch(req).then(res => {
+      if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
+      return res;
+    }).catch(() => cached))
   );
 });

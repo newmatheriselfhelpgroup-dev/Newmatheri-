@@ -1,16 +1,17 @@
 {
+  "id": "./",
   "name": "New Matheri Self Help Group",
   "short_name": "Matheri SHG",
-  "description": "Members, contributions, deductions and collection sessions for New Matheri Self Help Group",
-  "start_url": "./New_Matheri_Sys.html",
+  "description": "New Matheri Self Help Group management system — works offline.",
+  "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "orientation": "portrait-primary",
-  "background_color": "#F5F5F3",
+  "orientation": "any",
+  "background_color": "#1F3864",
   "theme_color": "#1F3864",
   "icons": [
     { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }
